@@ -124,7 +124,7 @@ def run(game: str, language: str, year: Optional[int], gpu: Optional[str],
         print(f"❌ FAIL: {e}")
         sys.exit(1)
 
-    fetch = steam_api.fetch_reviews_new_api(appid, normalized, target_count=500)
+    fetch = steam_api.fetch_reviews_new_api(appid, normalized)
     raw = fetch["reviews"]
     print(f"  appid: {appid}")
     print(f"  fetched: {len(raw)}")

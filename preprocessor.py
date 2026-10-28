@@ -42,7 +42,7 @@ EMOJI_REGEX = re.compile(
 
 MEANINGFUL_CHAR_REGEX = re.compile(r'\w', re.UNICODE)
 
-MIN_REVIEW_LENGTH = 40
+MIN_REVIEW_LENGTH = 15
 
 # ==========================================
 # Токенизация для матчинга по железу

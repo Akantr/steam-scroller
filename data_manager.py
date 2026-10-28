@@ -2,6 +2,10 @@ import gc
 import logging
 from typing import Any, Dict, List
 
+import hashlib
+import os
+import json
+
 import numpy as np
 from sklearn.cluster import KMeans
 from sentence_transformers import SentenceTransformer
@@ -18,7 +22,7 @@ EMBEDDING_MODEL_NAME = "intfloat/multilingual-e5-small"
 DUPLICATE_THRESHOLD = 0.85
 DEFAULT_MAX_OUTPUT = 80
 MAX_CLUSTERS = 7
-DEFAULT_TARGET_REVIEWS = 500
+DEFAULT_TARGET_REVIEWS = 1000
 MIN_REVIEWS_FOR_SUMMARY = 30
 
 # Группы intent'ов (источник истины — intent.IntentOutput)
@@ -253,8 +257,31 @@ def _make_stub(message: str) -> Dict[str, Any]:
 # 5. Главный класс-оркестратор
 # ==========================================
 class DataManager:
-    def __init__(self, max_output: int = DEFAULT_MAX_OUTPUT):
+    def __init__(self, max_output: int = DEFAULT_MAX_OUTPUT, cache_dir: str = "cache"):
         self.max_output = max_output
+        self.cache_dir = cache_dir
+        # Создаем папку для кэша, если её нет
+        os.makedirs(self.cache_dir, exist_ok=True)
+
+    def _get_cache_key(self, appid: int, normalized_params: dict) -> str:
+        """
+        Создает MD5-хэш на основе appid и фильтров, влияющих на запрос к Steam API.
+        Исключаем из хэша поля, которые не влияют на выдачу API (например, sub_tasks).
+        """
+        # Оставляем только те поля, которые реально отправляются в Steam API
+        api_relevant_keys = {
+            "languages", "review_type", "purchase_type", "sort_by",
+            "day_range", "date_range_start", "date_range_end",
+            "min_playtime_hours", "max_playtime_hours",
+            "hardware_os", "hardware_cpu", "hardware_gpu"
+        }
+        params_to_hash = {
+            k: v for k, v in normalized_params.items() if k in api_relevant_keys
+        }
+        
+        # Сортируем ключи для консистентности хэша
+        params_str = json.dumps(params_to_hash, sort_keys=True)
+        return hashlib.md5(f"{appid}_{params_str}".encode("utf-8")).hexdigest()
 
     def process(self, intent_json: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -294,7 +321,28 @@ class DataManager:
         except steam_api.SteamAPIError as e:
             return _make_error(f"Ошибка Steam API: {e}")
 
-        # Шаг 4. Сбор отзывов
+        # ==========================================
+        # ШАГ 4. ПРОВЕРКА КЭША (Local Storage)
+        # ==========================================
+        cache_key = self._get_cache_key(appid, normalized)
+        cache_file = os.path.join(self.cache_dir, f"{cache_key}.json")
+
+        if os.path.exists(cache_file):
+            logger.info(f"Кэш найден: {cache_file}")
+            try:
+                with open(cache_file, "r", encoding="utf-8") as f:
+                    cached_data = json.load(f)
+                
+                # ВАЖНО: Обновляем sub_tasks, так как они зависят от ТЕКУЩЕГО запроса,
+                # а не от того, что было закэшировано.
+                cached_data["sub_tasks"] = normalized.get("sub_tasks", [])
+                return cached_data
+            except Exception as e:
+                logger.warning(f"Ошибка чтения кэша ({e}). Загружаем данные заново.")
+
+        # ==========================================
+        # ШАГ 5. СБОР ОТЗЫВОВ (Если кэша нет)
+        # ==========================================
         try:
             fetch = steam_api.fetch_reviews_new_api(
                 appid,
@@ -313,11 +361,7 @@ class DataManager:
                 f"Не удалось найти отзывы для игры '{target_game}'."
             )
 
-        # Шаг 5. Очистка и безопасность
-        # ВНИМАНИЕ: следующие два шага используют текущую сигнатуру
-        # preprocessor.clean_reviews -> List[Dict]. При рефакторинге
-        # preprocessor стоит возвращать структурированный результат,
-        # чтобы явно сообщать о срабатывании текстового hardware-fallback.
+        # Шаг 6. Очистка и безопасность
         clean_result = preprocessor.clean_reviews(
             raw_reviews=raw_reviews,
             hardware_fallback=api_fallback,
@@ -333,12 +377,28 @@ class DataManager:
                 "Все отзывы были отфильтрованы как неинформативные."
             )
 
-        # Шаг 6. Семантическая обработка
+        # Шаг 7. Семантическая обработка
         final_texts = semantic_filter(cleaned_reviews, max_output=self.max_output)
         if not final_texts:
             return _make_error("Не удалось отобрать отзывы для анализа.")
+        
+        # Формируем словарь для примененных фильтров
+        applied_filters = {
+            key: normalized.get(key)
+            for key in (
+                "languages", "review_type", "purchase_type", "sort_by",
+                "day_range", "date_range_start", "date_range_end",
+                "min_playtime_hours", "max_playtime_hours",
+                "hardware_os", "hardware_cpu", "hardware_gpu",
+            )
+            if normalized.get(key) not in (None, [], 0, "")
+        }
+
+        # ==========================================
+        # ШАГ 8. ФОРМИРОВАНИЕ ОТВЕТА
+        # ==========================================
         if len(final_texts) < MIN_REVIEWS_FOR_SUMMARY:
-            return {
+            result = {
                 "status": "insufficient_data",
                 "message": (
                     f"Найдено только {len(final_texts)} отзывов "
@@ -348,6 +408,7 @@ class DataManager:
                 "appid": appid,
                 "reviews_count": len(final_texts),
                 "reviews": final_texts,
+                "sub_tasks": normalized.get("sub_tasks", []), # ИСПРАВЛЕНО: прокидываем sub_tasks
                 "meta": {
                     "raw_reviews_count": raw_count,
                     "cleaned_reviews_count": cleaned_count,
@@ -357,56 +418,45 @@ class DataManager:
                     "applied_filters": applied_filters,
                 },
             }
-
-        # Шаг 7. Формирование ответа для Map-этапа
-        has_hw_filter = bool(
-            normalized.get("hardware_os")
-            or normalized.get("hardware_gpu")
-            or normalized.get("hardware_cpu")
-        )
-
-        applied_filters = {
-            key: normalized.get(key)
-            for key in (
-                "languages",
-                "review_type",
-                "purchase_type",
-                "sort_by",
-                "day_range",
-                "date_range_start",
-                "date_range_end",
-                "min_playtime_hours",
-                "max_playtime_hours",
-                "hardware_os",
-                "hardware_cpu",
-                "hardware_gpu",
+        else:
+            has_hw_filter = bool(
+                normalized.get("hardware_os")
+                or normalized.get("hardware_gpu")
+                or normalized.get("hardware_cpu")
             )
-            if normalized.get(key) not in (None, [], 0, "")
-        }
 
-        return {
-            "status": "ready_for_summary",
-            "game": target_game,
-            "appid": appid,
-            "reviews_count": len(final_texts),
-            "reviews": final_texts,
-            "meta": {
-                # Счётчики пайплайна (для диагностики и логирования)
-                "raw_reviews_count": raw_count,
-                "cleaned_reviews_count": cleaned_count,
-                "final_reviews_count": len(final_texts),
-                # Флаги фильтрации
-                "cleaning": clean_stats,
-                "used_hardware_filter": has_hw_filter,
-                "api_fallback_applied": api_fallback,
-                # Метаданные из нового API (октябрь 2026)
-                "total_matching": fetch.get("total_matching"),
-                "day_range_used": fetch.get("day_range_used"),
-                # Фактически применённые фильтры
-                "cleaning": clean_stats,
-                "applied_filters": applied_filters,
-            },
-        }
+            result = {
+                "status": "ready_for_summary",
+                "game": target_game,
+                "appid": appid,
+                "reviews_count": len(final_texts),
+                "reviews": final_texts,
+                "sub_tasks": normalized.get("sub_tasks", []), # ИСПРАВЛЕНО: прокидываем sub_tasks
+                "meta": {
+                    "raw_reviews_count": raw_count,
+                    "cleaned_reviews_count": cleaned_count,
+                    "final_reviews_count": len(final_texts),
+                    "cleaning": clean_stats,
+                    "used_hardware_filter": has_hw_filter,
+                    "api_fallback_applied": api_fallback,
+                    "total_matching": fetch.get("total_matching"),
+                    "day_range_used": fetch.get("day_range_used"),
+                    "applied_filters": applied_filters,
+                },
+            }
+
+        # ==========================================
+        # ШАГ 9. СОХРАНЕНИЕ В КЭШ
+        # ==========================================
+        try:
+            with open(cache_file, "w", encoding="utf-8") as f:
+                json.dump(result, f, ensure_ascii=False, indent=2)
+            logger.info(f"Данные успешно сохранены в кэш: {cache_file}")
+        except Exception as e:
+            # Ошибка записи в кэш не должна ломать основной сценарий
+            logger.error(f"Не удалось сохранить кэш: {e}")
+
+        return result
 
 
 # ==========================================

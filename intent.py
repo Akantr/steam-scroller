@@ -18,12 +18,11 @@ logger = logging.getLogger(__name__)
 # Константы
 # ==========================================
 OLLAMA_BASE_URL = "http://localhost:11434"
-OLLAMA_MODEL_NAME = "qwen2.5"  # Оставляем плавающий тег: локальная модель так называется
+OLLAMA_MODEL_NAME = "qwen2.5"
 SERVER_START_TIMEOUT_SECONDS = 10
 UNLOAD_TIMEOUT_SECONDS = 5
 RETRY_BACKOFF_BASE_SECONDS = 1.5
 
-# Стрип markdown-обёрток ```json ... ``` / ``` ... ```
 _CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
 
 
@@ -53,7 +52,6 @@ class OllamaManager:
 
         logger.info("Запуск сервера Ollama...")
 
-        # Кросс-платформенное отсоединение дочернего процесса
         popen_kwargs: Dict[str, Any] = {
             "stdin": subprocess.DEVNULL,
             "stdout": subprocess.DEVNULL,
@@ -72,7 +70,6 @@ class OllamaManager:
                 "https://ollama.com/download"
             ) from e
 
-        # Ждём готовности с фиксированным таймаутом
         for _ in range(SERVER_START_TIMEOUT_SECONDS):
             if self.is_running():
                 logger.info("Ollama успешно запущена.")
@@ -86,7 +83,6 @@ class OllamaManager:
     # ---- Выгрузка модели ----
     def unload_model(self) -> None:
         """Выгружает модель из памяти (освобождает VRAM/RAM)."""
-        # Если Python завершает работу, сетевые запросы делать нельзя
         if sys.is_finalizing():
             return
 
@@ -100,17 +96,9 @@ class OllamaManager:
         except Exception as e:
             logger.warning(f"Не удалось выгрузить модель {self.model_name}: {e}")
 
-
-    # ---- Управление жизненным циклом ----
-    def __del__(self):
-        # Безопасный вызов на случай, если close() не был вызван явно
-        if sys.is_finalizing():
-            return
-        try:
-            self.close()
-        except Exception:
-            pass
-
+    def close(self) -> None:
+        """Освобождает ресурсы (выгружает модель)."""
+        self.unload_model()
 
     def __enter__(self) -> "OllamaManager":
         self.start_server()
@@ -119,20 +107,11 @@ class OllamaManager:
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         self.close()
 
-    def __del__(self):
-        # Безопасный вызов на случай, если close() не был вызван явно
-        try:
-            self.close()
-        except Exception:
-            pass
-
 
 # ==========================================
 # 2. Pydantic-схема
 # ==========================================
 class IntentOutput(BaseModel):
-    """Единая схема выхода IntentExtractor. Является контрактом для
-    data_manager.process()."""
     intent: Literal["analyze_reviews", "rank_games", "free_talk", "clarify", "unknown"]
     confidence: float = Field(..., ge=0.0, le=1.0)
 
@@ -140,18 +119,15 @@ class IntentOutput(BaseModel):
     genre_or_tags: List[str] = Field(default_factory=list)
     sub_tasks: List[Literal["table", "graph"]] = Field(default_factory=list)
 
-    # Фильтры отзывов
     languages: Optional[List[str]] = None
     review_type: Optional[Literal["positive", "negative", "all"]] = None
     purchase_type: Optional[Literal["steam", "non_steam_purchase", "all"]] = None
     sort_by: Optional[Literal["helpful", "recent", "updated"]] = None
 
-    # Временные и игровые фильтры
     time_filter_text: Optional[str] = None
     min_playtime_hours: Optional[int] = None
     max_playtime_hours: Optional[int] = None
 
-    # Аппаратные фильтры
     hardware_os: Optional[Literal["windows", "mac", "linux"]] = None
     hardware_cpu: Optional[str] = None
     hardware_gpu: Optional[str] = None
@@ -206,47 +182,38 @@ class IntentExtractor:
 Верни только JSON.
 """
 
-    def __init__(self, model_name: str = OLLAMA_MODEL_NAME):
-        self.ollama = OllamaManager(model_name=model_name)
-        self.ollama.start_server()
+    def __init__(self, model_name: str = OLLAMA_MODEL_NAME, ollama_manager: Optional[OllamaManager] = None):
+        # ИСПОЛЬЗУЕМ ПЕРЕДАННЫЙ МЕНЕДЖЕР (синглтон) ИЛИ СОЗДАЕМ НОВЫЙ
+        self.ollama = ollama_manager if ollama_manager else OllamaManager(model_name=model_name)
+        
+        if not self.ollama.is_running():
+            self.ollama.start_server()
 
         self.client = OpenAI(
             base_url=self.ollama.client_url,
-            api_key="ollama",  # Ollama не требует ключ локально
+            api_key="ollama",
         )
         self.model_name = model_name
 
-    # ---- Внутренние хелперы ----
     @staticmethod
     def _strip_code_fences(raw: str) -> str:
-        """Удаляет ```json ... ``` или ``` ... ``` обёртку, если модель её добавила."""
         return _CODE_FENCE_RE.sub("", raw.strip()).strip()
 
     @staticmethod
     def _fallback_intent() -> Dict[str, Any]:
-        """Возвращает валидный по схеме fallback-интент."""
         return IntentOutput(
             intent="unknown",
             confidence=0.0,
             data_retrieval_needed=False,
         ).model_dump()
 
-    # ---- Основной метод ----
     def extract_intent(
         self,
         user_query: str,
         history: Optional[List[Dict[str, str]]] = None,
         max_retries: int = 2,
     ) -> Dict[str, Any]:
-        """
-        Отправляет запрос в локальную модель.
-
-        :param user_query: Текущий запрос пользователя.
-        :param history: Прошлые сообщения [{"role": ..., "content": ...}].
-            Берутся последние 3.
-        :param max_retries: Количество попыток на случай невалидного JSON.
-        :return: dict, валидированный по IntentOutput.
-        """
+        
         messages: List[Dict[str, str]] = [
             {"role": "system", "content": self.SYSTEM_PROMPT}
         ]
@@ -254,104 +221,66 @@ class IntentExtractor:
             messages.extend(history[-3:])
         messages.append({"role": "user", "content": user_query})
 
-        try:
-            for attempt in range(max_retries):
-                try:
-                    response = self.client.chat.completions.create(
-                        model=self.model_name,
-                        messages=messages,
-                        temperature=0.0,
-                        max_tokens=1024,
-                        response_format={"type": "json_object"},
-                    )
-                    raw = response.choices[0].message.content or ""
-                    cleaned = self._strip_code_fences(raw)
-                    parsed = json.loads(cleaned)
-                    validated = IntentOutput(**parsed)
-                    return validated.model_dump()
+        for attempt in range(max_retries):
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model_name,
+                    messages=messages,
+                    temperature=0.0,
+                    max_tokens=1024,
+                    response_format={"type": "json_object"},
+                )
+                raw = response.choices[0].message.content or ""
+                cleaned = self._strip_code_fences(raw)
+                parsed = json.loads(cleaned)
+                validated = IntentOutput(**parsed)
+                return validated.model_dump()
 
-                except json.JSONDecodeError as e:
-                    logger.warning(
-                        f"Попытка {attempt + 1}/{max_retries}: "
-                        f"невалидный JSON. Ошибка: {e}"
-                    )
-                    messages.append({
-                        "role": "user",
-                        "content": "Ошибка: ты вернул невалидный JSON. "
-                                   "Верни строго JSON без markdown и без пояснений.",
-                    })
+            except json.JSONDecodeError as e:
+                logger.warning(f"Попытка {attempt + 1}/{max_retries}: невалидный JSON. Ошибка: {e}")
+                messages.append({
+                    "role": "user",
+                    "content": "Ошибка: ты вернул невалидный JSON. Верни строго JSON без markdown и без пояснений.",
+                })
 
-                except ValidationError as e:
-                    logger.warning(
-                        f"Попытка {attempt + 1}/{max_retries}: "
-                        f"JSON не соответствует схеме. Ошибка: {e}"
-                    )
-                    messages.append({
-                        "role": "user",
-                        "content": f"Ошибка: твой JSON не соответствует схеме. "
-                                   f"Детали: {e}. Исправь.",
-                    })
+            except ValidationError as e:
+                logger.warning(f"Попытка {attempt + 1}/{max_retries}: JSON не соответствует схеме. Ошибка: {e}")
+                messages.append({
+                    "role": "user",
+                    "content": f"Ошибка: твой JSON не соответствует схеме. Детали: {e}. Исправь.",
+                })
 
-                except openai.NotFoundError as e:
-                    # Модель не найдена — ретраи бессмысленны
-                    logger.error(
-                        f"Модель {self.model_name!r} не найдена в Ollama. "
-                        f"Убедитесь, что она загружена: ollama pull {self.model_name}. "
-                        f"Детали: {e}"
-                    )
-                    break
+            except openai.NotFoundError as e:
+                logger.error(f"Модель {self.model_name!r} не найдена. Детали: {e}")
+                break
 
-                except (openai.APIConnectionError, openai.APITimeoutError) as e:
-                    logger.warning(
-                        f"Попытка {attempt + 1}/{max_retries}: "
-                        f"сетевая ошибка при обращении к Ollama: {e}"
-                    )
-                    if attempt < max_retries - 1:
-                        time.sleep(RETRY_BACKOFF_BASE_SECONDS * (2 ** attempt))
+            except (openai.APIConnectionError, openai.APITimeoutError) as e:
+                logger.warning(f"Попытка {attempt + 1}/{max_retries}: сетевая ошибка: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(RETRY_BACKOFF_BASE_SECONDS * (2 ** attempt))
 
-                except openai.APIError as e:
-                    logger.warning(
-                        f"Попытка {attempt + 1}/{max_retries}: "
-                        f"ошибка OpenAI-совместимого API: {e}"
-                    )
-                    if attempt < max_retries - 1:
-                        time.sleep(RETRY_BACKOFF_BASE_SECONDS * (2 ** attempt))
+            except openai.APIError as e:
+                logger.warning(f"Попытка {attempt + 1}/{max_retries}: ошибка API: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(RETRY_BACKOFF_BASE_SECONDS * (2 ** attempt))
 
-                except Exception as e:
-                    # Непредвиденное — логируем и выходим из цикла
-                    logger.exception(
-                        f"Попытка {attempt + 1}/{max_retries}: "
-                        f"непредвиденная ошибка: {type(e).__name__}: {e}"
-                    )
-                    break
+            except Exception as e:
+                logger.exception(f"Попытка {attempt + 1}/{max_retries}: непредвиденная ошибка: {type(e).__name__}: {e}")
+                break
 
-            logger.error("Не удалось получить валидный интент от LLM.")
-            return self._fallback_intent()
-
-        finally:
-            # Модель выгружается всегда — и при успехе, и при исключении (NFR-006)
-            self.ollama.unload_model()
+        logger.error("Не удалось получить валидный интент от LLM.")
+        return self._fallback_intent()
 
     def close(self) -> None:
-        """Освобождает ресурсы. Вызывать по завершении работы приложения."""
-        self.ollama.close()
+        """
+        Ничего не делаем. Жизненным циклом OllamaManager управляет DialogManager.
+        Если IntentExtractor используется автономно (без DialogManager) - 
+        вызывайте self.ollama.unload_model() вручную.
+        """
+        pass
 
     def __enter__(self) -> "IntentExtractor":
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         self.close()
-
-
-# ==========================================
-# Пример использования (для отладки)
-# ==========================================
-if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
-
-    with IntentExtractor() as extractor:
-        result = extractor.extract_intent("AMD Ryzen 5 7535HS, Satisfactory.")
-        print(json.dumps(result, indent=2, ensure_ascii=False))
