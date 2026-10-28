@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.json
+eval/
+
+# Модели и данные — НЕ коммитим
+models/
+*.gguf
+*.safetensors
+*.bin
+*.pt
+*.pth
+data/
+logs/
+*.log
+
+# Кэш HF / vLLM
+.cache/
+huggingface/
