@@ -6,6 +6,7 @@ venv/
 .env
 .json
 eval/
+test/
 
 # Модели и данные — НЕ коммитим
 models/
