@@ -467,7 +467,7 @@ if __name__ == "__main__":
     test_intent = {
         "intent": "analyze_reviews",
         "confidence": 0.98,
-        "target_game": "hades",
+        "target_game": "elden ring",
         "genre_or_tags": [],
         "sub_tasks": [],
         "languages": ["all"],

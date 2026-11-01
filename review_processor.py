@@ -132,6 +132,8 @@ def _validate_finding(finding: Any, batch: List) -> Optional[Dict[str, Any]]:
     }
 
 
+
+
 # ==========================================
 # ReviewProcessor
 # ==========================================
@@ -272,7 +274,7 @@ class ReviewProcessor:
 КРИТИЧЕСКИЕ ПРАВИЛА:
 1. Каждый finding обязан содержать "source_id" — целое число из заголовка
    [Отзыв N | id=N], откуда взята цитата. Без source_id finding бесполезен.
-2. "quote" — ТОЧНАЯ ПОДСТРОКА из отзыва с указанным source_id, 15–{MAX_QUOTE_LEN} символов.
+2. "quote" — ТОЧНАЯ ПОДСТРОКА из отзыва на оригинальном языке с указанным source_id, 15–{MAX_QUOTE_LEN} символов. 
    Запрещены: чеклисты (☐, ☑), наборы цифр, эмодзи-списки.
 3. Не более {MAP_MAX_FINDINGS} findings на батч. Лучше 3 достоверных, чем 6 притянутых.
 4. "topic" — короткое название темы (1–3 слова): Оптимизация, Сюжет, Боссы, Баги и т.п.
@@ -286,10 +288,18 @@ class ReviewProcessor:
 4. Отзыв без описания игрового опыта — пропускай. Пустой результат корректен.
 5. Только текст отзывов, никаких знаний об игре "из головы".
 
+ПОРЯДОК РАБОТЫ:
+1. Сначала найди в отзыве с source_id конкретное предложение — цитату.
+2. Потом сформулируй topic ИСХОДЯ ИЗ ЦИТАТЫ, а не из общих знаний об игре.
+   Если цитата про баги — topic должен быть про баги, даже если ты знаешь,
+   что у игры ещё есть проблемы с оптимизацией.
+3. Topic — короткая фраза (1–3 слова), описывающая именно то,
+   что утверждает эта цитата.
+
 Верни строго JSON:
 {{
 "findings": [
-  {{"source_id": 3, "topic": "Оптимизация", "sentiment": "positive", "quote": "Игра летает даже на старом ПК"}}
+  {{"source_id": 3, "quote": "Игра летает даже на старом ПК", "topic": "Оптимизация", "sentiment": "positive"}}
 ]
 }}
 
@@ -314,6 +324,41 @@ class ReviewProcessor:
             logger.debug("Map: %d/%d findings отброшено валидацией", rejected, len(findings))
 
         return valid[:MAP_MAX_FINDINGS]
+
+    def _validate_points(
+        self,
+        points: List[Dict[str, Any]],
+        by_id: Dict[str, Dict[str, Any]],
+        existing_features: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Валидация пунктов Reduce. Цитату берём из by_id, а не из LLM."""
+        valid: List[Dict[str, Any]] = []
+        seen = {f.strip().lower() for f in (existing_features or [])}
+
+        for p in points:
+            if not isinstance(p, dict):
+                continue
+            feature = (p.get("feature") or "").strip()
+            if not feature or feature.lower() in seen:
+                continue
+
+            raw_ids = p.get("finding_ids") or []
+            ids = [i for i in raw_ids if isinstance(i, str) and i in by_id]
+            if len(ids) < 2:  # правило: минимум 2 независимых факта
+                continue
+
+            pq_id = p.get("primary_quote_id")
+            if pq_id not in ids:
+                pq_id = ids[0]  # fallback
+
+            seen.add(feature.lower())
+            valid.append({
+                "feature": feature,
+                "description": (p.get("description") or "").strip(),
+                "quote": by_id[pq_id]["quote"],
+                "finding_ids": ids,
+            })
+        return valid
 
     # ---------- Reduce: саммари ----------
     def _reduce_summary(
@@ -348,6 +393,12 @@ class ReviewProcessor:
 5. Каждый пункт — минимум 2 независимых факта в "finding_ids".
    Если достоверных меньше 7 — верни меньше. Пять честных лучше семи выдуманных.
 
+Для каждого пункта верни:
+- finding_ids: все факты, на которых основан пункт (мин. 2)
+- primary_quote_id: id того факта, чья цитата ЛУЧШЕ ВСЕГО
+  иллюстрирует этот пункт. Она попадёт в саммари.
+  Убедись, что цитата с этим id действительно про заявленную feature.
+
 ПРАВИЛА PLAYTIME:
 1. playtime_forever > playtime_at_review НЕ равно "реиграбельность".
 2. Сильный сигнал: тег "ОТЗЫВ БЫЛ ДОПОЛНЕН ПОЗЖЕ" + playtime_forever > 100 ч.
@@ -360,7 +411,7 @@ class ReviewProcessor:
 Верни строго JSON:
 {{
 "summary_points": [
-  {{"feature": "Оптимизация", "description": "Игра стабильно работает...", "finding_ids": ["f3", "f17"]}}
+  {{"feature": "Оптимизация", "description": "Игра стабильно работает...", "finding_ids": ["f3", "f17"]", primary_quote_id": "f17"}}
 ]
 }}
 
@@ -429,37 +480,6 @@ class ReviewProcessor:
                 f"> *{p['quote']}*\n\n"
             )
         return md
-
-    def _validate_points(
-        self,
-        points: List[Dict[str, Any]],
-        by_id: Dict[str, Dict[str, Any]],
-        existing_features: Optional[List[str]] = None,
-    ) -> List[Dict[str, Any]]:
-        """Валидация пунктов Reduce. Цитату берём из by_id, а не из LLM."""
-        valid: List[Dict[str, Any]] = []
-        seen = {f.strip().lower() for f in (existing_features or [])}
-
-        for p in points:
-            if not isinstance(p, dict):
-                continue
-            feature = (p.get("feature") or "").strip()
-            if not feature or feature.lower() in seen:
-                continue
-
-            raw_ids = p.get("finding_ids") or []
-            ids = [i for i in raw_ids if isinstance(i, str) and i in by_id]
-            if len(ids) < 2:  # правило: минимум 2 независимых факта
-                continue
-
-            seen.add(feature.lower())
-            valid.append({
-                "feature": feature,
-                "description": (p.get("description") or "").strip(),
-                "quote": by_id[ids[0]]["quote"],
-                "finding_ids": ids,
-            })
-        return valid
 
     # ---------- Reduce: таблица ----------
     def _reduce_table(
@@ -586,7 +606,7 @@ if __name__ == "__main__":
     )
 
     # === ПОДСТАВЬТЕ НАЗВАНИЕ ФАЙЛА ЗДЕСЬ ===
-    CACHE_FILE = "cache/4abcb290a2631f3eee48d29b200b42e7.json"
+    CACHE_FILE = "cache/d5fa8d2d28381055225300452be33b20.json"
     # =======================================
 
     # Опционально: можно переопределить через аргумент командной строки
