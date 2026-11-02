@@ -23,6 +23,9 @@ REVIEW_TRUNCATE = 600        # было 900 — режем контекст
 MAX_QUOTE_LEN = 180
 MIN_QUOTE_LEN = 15
 QUOTE_FUZZY_THRESHOLD = 90
+TOPIC_FUZZY_THRESHOLD = 82
+QUOTE_SIM_THRESHOLD = 0.80
+
 
 _CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
 
@@ -131,7 +134,20 @@ def _validate_finding(finding: Any, batch: List) -> Optional[Dict[str, Any]]:
         "quote": quote,
     }
 
+def _topic_aligned(finding_topic: str, feature: str) -> bool:
+    """Лексическое совпадение topic ↔ feature. Быстро, без ML."""
+    return fuzz.token_set_ratio(
+            finding_topic.lower().strip(),
+            feature.lower().strip(),
+        ) >= TOPIC_FUZZY_THRESHOLD
 
+_EMBEDDER = None
+def _get_embedder():
+    global _EMBEDDER
+    if _EMBEDDER is None:
+        from sentence_transformers import SentenceTransformer
+        _EMBEDDER = SentenceTransformer("intfloat/multilingual-e5-small")
+    return _EMBEDDER
 
 
 # ==========================================
@@ -148,6 +164,25 @@ class ReviewProcessor:
         self.model_name = model_name
         self.ollama_client = ollama
         self.batch_size = batch_size
+
+    def _embedding_best(self, feature, description, ids, by_id):
+        try:
+            embedder = _get_embedder()
+        except Exception as e:
+            logger.warning("Embedder недоступен: %s", e)
+            return None
+
+        query = f"query: {feature}. {description}"
+        passages = [f"passage: {by_id[i]['quote']}" for i in ids]
+
+        qv = embedder.encode(query, normalize_embeddings=True)
+        pv = embedder.encode(passages, normalize_embeddings=True)
+        sims = (pv @ qv).tolist()
+        best_k = max(range(len(sims)), key=lambda k: sims[k])
+
+        if sims[best_k] < QUOTE_SIM_THRESHOLD:
+            return None
+        return ids[best_k]
 
     # ---------- Оркестрация ----------
     def process(self, dm_output: Dict[str, Any], user_query: str = "") -> Dict[str, Any]:
@@ -296,6 +331,20 @@ class ReviewProcessor:
 3. Topic — короткая фраза (1–3 слова), описывающая именно то,
    что утверждает эта цитата.
 
+ПРИМЕРЫ ХОРОШИХ findings (цитата явно про заявленный topic):
+✅ {{"source_id": 3, "quote": "Игра летает даже на старом ПК, стабильные 60 фпс", "topic": "Оптимизация", "sentiment": "positive"}}
+✅ {{"source_id": 7, "quote": "Музыка в бою с боссом пробирает до мурашек", "topic": "Саундтрек", "sentiment": "positive"}}
+✅ {{"source_id": 12, "quote": "После патча 1.04 игра стала заметно стабильнее", "topic": "Оптимизация", "sentiment": "mixed"}}
+✅ {{"source_id": 18, "quote": "Боссы требуют заучивания паттернов, но каждый бой честный", "topic": "Боссы", "sentiment": "positive"}}
+
+ПРИМЕРЫ ПЛОХИХ findings (цитата НЕ про этот topic — так НЕЛЬЗЯ):
+❌ {{"source_id": 5, "quote": "Elden Ring é um jogo fantástico", "topic": "Оптимизация"}}
+   ← цитата про общее впечатление, а не про производительность
+❌ {{"source_id": 9, "quote": "I rate this game 10/10", "topic": "Звук"}}
+   ← цитата про общую оценку, а не про музыку/звук
+❌ {{"source_id": 14, "quote": "Это лучшая игра в моей жизни", "topic": "Сюжет"}}
+   ← цитата про общее впечатление, а не про историю
+
 Верни строго JSON:
 {{
 "findings": [
@@ -324,15 +373,9 @@ class ReviewProcessor:
             logger.debug("Map: %d/%d findings отброшено валидацией", rejected, len(findings))
 
         return valid[:MAP_MAX_FINDINGS]
-
-    def _validate_points(
-        self,
-        points: List[Dict[str, Any]],
-        by_id: Dict[str, Dict[str, Any]],
-        existing_features: Optional[List[str]] = None,
-    ) -> List[Dict[str, Any]]:
-        """Валидация пунктов Reduce. Цитату берём из by_id, а не из LLM."""
-        valid: List[Dict[str, Any]] = []
+    
+    def _validate_points(self, points, by_id, existing_features=None):
+        valid = []
         seen = {f.strip().lower() for f in (existing_features or [])}
 
         for p in points:
@@ -344,21 +387,45 @@ class ReviewProcessor:
 
             raw_ids = p.get("finding_ids") or []
             ids = [i for i in raw_ids if isinstance(i, str) and i in by_id]
-            if len(ids) < 2:  # правило: минимум 2 независимых факта
+            if len(ids) < 2:
+                # Единственный случай, когда дропаем: Reduce выдумал id
+                logger.warning("Feature %r: <2 валидных finding_id. Дроп.", feature)
                 continue
 
-            pq_id = p.get("primary_quote_id")
-            if pq_id not in ids:
-                pq_id = ids[0]  # fallback
+            # Фильтр по sentiment пункта (см. п.2 ниже)
+            point_sent = (p.get("sentiment") or "mixed").lower()
+            if point_sent in ("positive", "negative"):
+                ids = [
+                    i for i in ids
+                    if by_id[i].get("sentiment", "mixed") in (point_sent, "mixed")
+                ] or ids  # не режем до нуля — лучше оставить все
+
+            # Best-effort выбор цитаты; пункт сохраняется всегда
+            quote_id = self._pick_quote_id(feature, p.get("description", ""), ids, by_id)
 
             seen.add(feature.lower())
             valid.append({
                 "feature": feature,
                 "description": (p.get("description") or "").strip(),
-                "quote": by_id[pq_id]["quote"],
+                "quote": by_id[quote_id]["quote"] if quote_id else None,
                 "finding_ids": ids,
             })
         return valid
+
+    def _pick_quote_id(self, feature, description, ids, by_id):
+    # Ступень 1: topic-aligned
+        aligned = [i for i in ids if _topic_aligned(by_id[i]["topic"], feature)]
+        if aligned:
+            return max(aligned, key=lambda i: len(by_id[i]["quote"]))
+
+        # Ступень 2: embedding rerank внутри ids
+        quote_id = self._embedding_best(feature, description, ids, by_id)
+        if quote_id:
+            return quote_id
+
+        # Ступень 3: ничего не нашли — цитаты не будет, пункт останется
+        logger.info("Feature %r: цитата не подобрана (ids=%s)", feature, ids)
+        return None
 
     # ---------- Reduce: саммари ----------
     def _reduce_summary(
@@ -375,6 +442,7 @@ class ReviewProcessor:
             f"Поставь её на первое место."
             if user_query else ""
         )
+    
 
         prompt_1 = f"""
 Ты — профессиональный игровой журналист. Дан список фактов из отзывов на игру "{game}".
@@ -383,10 +451,13 @@ class ReviewProcessor:
 Составь сводку РОВНО ИЗ 7 ключевых особенностей игры.
 
 КРИТИЧЕСКИЕ ПРАВИЛА:
-1. ПРИОРИТЕТ РАЗНООБРАЗИЯ: 7 РАЗНЫХ категорий (Оптимизация, Боевая система, Сюжет,
-   Графика, Звук/Музыка, Цена/Контент, Сложность/Боссы). Не дроби одну тему.
+1. ПРИОРИТЕТ РАЗНООБРАЗИЯ: 7 РАЗНЫХ категорий. Не дроби одну тему.
 2. Если пользователь спросил про конкретную тему — поставь её первой, но дополни до 7.
-3. Описание — живое, 1–2 предложения. Следи за падежами.
+3а. Описание — живое, 1–2 предложения. Следи за падежами.
+3б. Описание должно быть СУММОЙ того, что говорят выбранные finding'и.
+    Не добавляй общие знания об игре, которых нет в цитатах.
+    Если в finding'ах нет прямого упоминания багов — не пиши "есть мелкие баги",
+    даже если ты знаешь, что они есть.
 4. Каждый пункт подкрепляй ТОЛЬКО существующими id из списка фактов.
    Возвращай массив "finding_ids" (например, ["f3", "f17"]), а не текст цитаты.
    Цитата подставится автоматически.
@@ -395,9 +466,6 @@ class ReviewProcessor:
 
 Для каждого пункта верни:
 - finding_ids: все факты, на которых основан пункт (мин. 2)
-- primary_quote_id: id того факта, чья цитата ЛУЧШЕ ВСЕГО
-  иллюстрирует этот пункт. Она попадёт в саммари.
-  Убедись, что цитата с этим id действительно про заявленную feature.
 
 ПРАВИЛА PLAYTIME:
 1. playtime_forever > playtime_at_review НЕ равно "реиграбельность".
@@ -408,10 +476,42 @@ class ReviewProcessor:
 2. "НИШЕВЫЙ ОТЗЫВ" — специфично для конфигурации, отметь в описании.
 3. "ВЫЗВАЛ ДИСКУССИЮ" — приоритетно, но проверяй тональность.
 
+ПРИМЕРЫ ПРАВИЛЬНОЙ ПРИВЯЗКИ finding_ids:
+
+✅ ПРАВИЛЬНО:
+{{
+  "feature": "Оптимизация",
+  "description": "Игра стабильно работает на средних системах, но в открытом мире есть просадки FPS.",
+  "sentiment": "mixed",
+  "finding_ids": ["f2", "f14", "f27"]
+}}
+← Все три finding'а имеют topic про производительность/оптимизацию.
+  Их цитаты: "Игра летает даже на старом ПК", "После патча 1.04 стало стабильнее", "В открытом мире просадки до 45 fps".
+
+✅ ПРАВИЛЬНО:
+{{
+  "feature": "Сюжет",
+  "description": "Лор спрятан в описаниях предметов и диалогах NPC, требует самостоятельной сборки.",
+  "sentiment": "mixed",
+  "finding_ids": ["f8", "f19"]
+}}
+← Оба finding'а имеют topic про сюжет/лор.
+
+❌ НЕПРАВИЛЬНО (так делать нельзя):
+{{
+  "feature": "Оптимизация",
+  "description": "Игра стабильно работает на высоких настройках...",
+  "finding_ids": ["f5", "f11"]
+}}
+← f5 = "Elden Ring é um jogo fantástico" (topic: Общее впечатление)
+  f11 = "10/10 if you are a Souls player" (topic: Рекомендация)
+  Оба finding'а НЕ про оптимизацию.
+
+
 Верни строго JSON:
 {{
 "summary_points": [
-  {{"feature": "Оптимизация", "description": "Игра стабильно работает...", "finding_ids": ["f3", "f17"]", primary_quote_id": "f17"}}
+  {{"feature": "Оптимизация", "description": "Игра стабильно работает...", "finding_ids": ["f3", "f17"]"}}
 ]
 }}
 
@@ -445,12 +545,29 @@ class ReviewProcessor:
 3. Используй ТОЛЬКО id из списка фактов ("finding_ids").
 4. Каждый пункт — минимум 2 независимых факта.
 
+
 Верни строго JSON:
 {{
 "summary_points": [
-  {{"feature": "Новая тема", "description": "Описание", "finding_ids": ["f5", "f9"]}}
+  {{"feature": "Новая тема", "description": "Описание", "sentiment": "positive", "finding_ids": ["f5", "f9"]}}
 ]
 }}
+
+ПРИМЕР ПРАВИЛЬНОГО пункта:
+✅ {{
+  "feature": "Реиграбельность",
+  "description": "Множество билдов и оружия делают повторные прохождения интересными.",
+  "sentiment": "positive",
+  "finding_ids": ["f22", "f41", "f58"]
+}}
+← Все три finding'а имеют topic про реиграбельность/билды/оружие.
+
+❌ {{
+  "feature": "Звук",
+  "description": "Хорошая музыка.",
+  "finding_ids": ["f7"]
+}}
+← f7 = "Игра года, 10/10" (topic: Рекомендация). Единственный finding не про звук. Невалидно.
 
 Список фактов:
 {combined_data}
@@ -474,11 +591,10 @@ class ReviewProcessor:
             return md + "*Не удалось выделить достоверные особенности на основе предоставленных отзывов.*\n"
 
         for i, p in enumerate(valid_points, 1):
-            md += (
-                f"**{i}. {p['feature']}**\n"
-                f"{p['description']}\n"
-                f"> *{p['quote']}*\n\n"
-            )
+            md += f"**{i}. {p['feature']}**\n{p['description']}\n"
+            if p.get("quote"):
+                md += f"> *{p['quote']}*\n"
+            md += "\n"
         return md
 
     # ---------- Reduce: таблица ----------
@@ -606,7 +722,7 @@ if __name__ == "__main__":
     )
 
     # === ПОДСТАВЬТЕ НАЗВАНИЕ ФАЙЛА ЗДЕСЬ ===
-    CACHE_FILE = "cache/d5fa8d2d28381055225300452be33b20.json"
+    CACHE_FILE = "cache/4abcb290a2631f3eee48d29b200b42e7.json"
     # =======================================
 
     # Опционально: можно переопределить через аргумент командной строки
