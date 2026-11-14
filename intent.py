@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 # Константы
 # ==========================================
 OLLAMA_BASE_URL = "http://localhost:11434"
-OLLAMA_MODEL_NAME = "Qwen3-4B"
+OLLAMA_MODEL_NAME = "qwen3.8-4b"
 SERVER_START_TIMEOUT_SECONDS = 10
 UNLOAD_TIMEOUT_SECONDS = 5
 RETRY_BACKOFF_BASE_SECONDS = 1.5

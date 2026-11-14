@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional
 
 from intent import IntentExtractor, OllamaManager, OLLAMA_MODEL_NAME
 from data_manager import DataManager
-from review_processor import ReviewProcessor
+from test.review_processor import ReviewProcessor
 
 logger = logging.getLogger(__name__)
 
