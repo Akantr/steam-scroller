@@ -1569,7 +1569,7 @@ if __name__ == "__main__":
         encoding="utf-8",
     )
 
-    CACHE_FILE = "cache/7ae871f03c7e4c31b5abfa65dfa8258a.json"
+    CACHE_FILE = "cache/89f39112b2b5bba88be145643efe7120.json"
     if len(sys.argv) > 1:
         CACHE_FILE = sys.argv[1]
 
@@ -1588,7 +1588,7 @@ if __name__ == "__main__":
         logger.error("Ошибка чтения файла: %s", e)
         sys.exit(1)
 
-    user_query = "Как там с оптимизацией и боссами?"
+    user_query = "«Составь сводку по Elden Ring"
 
     processor = ReviewProcessor()
     result = processor.process(dm_output, user_query=user_query)

@@ -288,7 +288,15 @@ class DataManager:
         self.cache_dir = cache_dir
         os.makedirs(self.cache_dir, exist_ok=True)
 
-    def _get_cache_key(self, appid: int, normalized_params: dict) -> str:
+    def _get_cache_key(
+        self,
+        appid: int,
+        target_game: str,
+        normalized_params: dict,
+        target_count: int = DEFAULT_TARGET_REVIEWS,
+        max_output: int = DEFAULT_MAX_OUTPUT,
+    ) -> str:
+        """Строит ключ кэша по названию игры, количеству отзывов и фильтрам."""
         api_relevant_keys = {
             "languages", "review_type", "purchase_type", "sort_by",
             "day_range", "date_range_start", "date_range_end",
@@ -298,8 +306,15 @@ class DataManager:
         params_to_hash = {
             k: v for k, v in normalized_params.items() if k in api_relevant_keys
         }
-        params_str = json.dumps(params_to_hash, sort_keys=True)
-        return hashlib.md5(f"{appid}_{params_str}".encode("utf-8")).hexdigest()
+        key_data = {
+            "appid": appid,
+            "target_game": target_game.strip().lower(),
+            "target_count": target_count,
+            "max_output": max_output,
+            "params": params_to_hash,
+        }
+        params_str = json.dumps(key_data, sort_keys=True, ensure_ascii=False)
+        return hashlib.md5(params_str.encode("utf-8")).hexdigest()
 
     def process(self, intent_json: Dict[str, Any]) -> Dict[str, Any]:
         try:
@@ -334,13 +349,50 @@ class DataManager:
             return _make_error(f"Ошибка Steam API: {e}")
 
         # ШАГ 4. ПРОВЕРКА КЭША
-        cache_key = self._get_cache_key(appid, normalized)
+        cache_key = self._get_cache_key(
+            appid,
+            target_game,
+            normalized,
+            target_count=DEFAULT_TARGET_REVIEWS,
+            max_output=self.max_output,
+        )
         cache_file = os.path.join(self.cache_dir, f"{cache_key}.json")
         if os.path.exists(cache_file):
             logger.info("Кэш найден: %s", cache_file)
             try:
                 with open(cache_file, "r", encoding="utf-8") as f:
                     cached_data = json.load(f)
+
+                # Проверяем, что кэш соответствует текущим фильтрам
+                applied_filters = {
+                    key: normalized.get(key)
+                    for key in (
+                        "languages", "review_type", "purchase_type", "sort_by",
+                        "day_range", "date_range_start", "date_range_end",
+                        "min_playtime_hours", "max_playtime_hours",
+                        "hardware_os", "hardware_cpu", "hardware_gpu",
+                    )
+                    if normalized.get(key) not in (None, [], 0, "")
+                }
+                cached_meta = cached_data.get("meta", {})
+                cached_filters = cached_meta.get("applied_filters", {})
+                if cached_filters != applied_filters:
+                    logger.warning(
+                        "Кэш не соответствует текущим applied_filters. Игнорируем."
+                    )
+                    raise ValueError("Cache filters mismatch")
+
+                current_has_hw = bool(
+                    normalized.get("hardware_os")
+                    or normalized.get("hardware_gpu")
+                    or normalized.get("hardware_cpu")
+                )
+                if cached_meta.get("used_hardware_filter") != current_has_hw:
+                    logger.warning(
+                        "Кэш не соответствует текущему наличию hardware-фильтра. Игнорируем."
+                    )
+                    raise ValueError("Cache hardware filter mismatch")
+
                 cached_data["sub_tasks"] = normalized.get("sub_tasks", [])
                 return cached_data
             except Exception as e:
