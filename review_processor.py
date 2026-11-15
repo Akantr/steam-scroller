@@ -14,6 +14,7 @@ from transformers import AutoTokenizer, AutoModelForQuestionAnswering
 from rapidfuzz import fuzz
 import ollama
 from intent import OllamaManager, OLLAMA_MODEL_NAME
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -997,32 +998,26 @@ class ReviewProcessor:
         return None
 
     def _collect_qa_quotes(
-        self, batch: List, query_questions: List[tuple],
-    ) -> List[Dict[str, Any]]:
+    self, batch: List, query_questions: List[tuple],
+) -> List[Dict[str, Any]]:
         if self.qa_model is None:
             return []
         questions = self._generate_questions_for_qa(query_questions)
         query_topics = {t.lower() for _, t in query_questions if t}
         collected: List[Dict[str, Any]] = []
 
-        for i, review in enumerate(batch, 1):
-            review_text = (
-                (review.get("review_text") or review.get("review") or "")
-                if isinstance(review, dict) else str(review)
-            )
-            if not review_text:
-                continue
-            seen_spans: set = set()
-            for q, topic_hint in questions:                     # ← без q_idx
-                r = self._extract_qa_span(q, review_text)
+        review_texts = [
+            (r.get("review_text") or r.get("review") or "") if isinstance(r, dict) else str(r)
+            for r in batch
+        ]
+
+        for q, topic_hint in questions:
+            spans = self._extract_qa_spans_batch(q, review_texts)
+            for i, r in enumerate(spans, 1):
                 if not r:
                     continue
-                span = r["span"]
-                if span in seen_spans:
-                    continue
-                seen_spans.add(span)
 
-                # буст по теме, а не по позиции вопроса
+                # буст по теме из запроса (а не по позиции вопроса)
                 boost = 1.15 if (topic_hint and topic_hint.lower() in query_topics) else 1.0
                 length_factor = (
                     0.85 + 0.30 * min(len(r["answer"]), MAX_QUOTE_LEN) / MAX_QUOTE_LEN
@@ -1031,13 +1026,20 @@ class ReviewProcessor:
                 collected.append({
                     "source_id": i,
                     "quote": r["answer"],
-                    "span": span,
+                    "span": r["span"],
                     "_qa_score": r["score"] * boost * length_factor,
                     "_qa_topic": topic_hint,
                 })
 
-        collected.sort(key=lambda x: -x["_qa_score"])
-        return collected[:MAP_MAX_QA_PER_BATCH]
+        # дедуп по (source_id, span) — span теперь координаты внутри конкретного контекста
+        dedup: Dict[tuple, Dict[str, Any]] = {}
+        for c in collected:
+            key = (c["source_id"], c["span"])
+            if key not in dedup or c["_qa_score"] > dedup[key]["_qa_score"]:
+                dedup[key] = c
+
+        result = sorted(dedup.values(), key=lambda x: -x["_qa_score"])
+        return result[:MAP_MAX_QA_PER_BATCH]
 
     def _categorize_quotes(self, extracted: List[Dict[str, Any]], game: str) -> List[Dict[str, Any]]:
         """Qwen расставляет topic/sentiment по индексам, НЕ пере-эмитит quote.
@@ -1158,13 +1160,17 @@ class ReviewProcessor:
         _dump_calibration_findings(all_findings)
 
         # опционально: сигнал «запроса нет в отзывах»
-        if query_questions and not any(
-            _matches_feature(f, t) for f in all_findings for _, t in query_questions
-        ):
-            logger.info(
-                "Запрос %r: темы %s не найдены среди %d findings",
-                user_query, [t for _, t in query_questions], len(all_findings),
-            )
+        if query_questions:
+            generic_topics = {"", "общее впечатление", "общее"}
+            thematic = [(q, t) for q, t in query_questions
+                        if (t or "").strip().lower() not in generic_topics]
+            if thematic and not any(
+                _matches_feature(f, t) for f in all_findings for _, t in thematic
+            ):
+                logger.info(
+                    "Запрос %r: темы %s не найдены среди %d findings",
+                    user_query, [t for _, t in thematic], len(all_findings),
+                )
 
         return all_findings
 
@@ -1186,7 +1192,7 @@ class ReviewProcessor:
 
     def _reformulate_query(self, user_query: str) -> List[tuple]:
         """user_query → [(question, topic), ...], ≤ QUERY_MAX_QUESTIONS.
-        Пустой список = использовать CONSTANT_QA_QUESTION."""
+        Пустой список = _generate_questions_for_qa вернёт GENERIC_QA_QUESTIONS."""
         if not user_query or not user_query.strip():
             return []
 
@@ -1210,9 +1216,18 @@ class ReviewProcessor:
         "question": "Какая фраза в отзыве выражает основное впечатление автора об игре?"}}
     5. Не выдумывай темы, которых в запросе нет.
 
-    Верни строго JSON:
-    {{"questions": [{{"topic": "Боевка",
-                    "question": "Какая фраза в отзыве описывает боевую систему?"}}]}}
+    ПРИМЕРЫ:
+
+    Запрос: "что с оптимизацией и боевкой?"
+    Ответ: {{"questions": [
+    {{"topic": "Оптимизация", "question": "Какая фраза в отзыве описывает оптимизацию и FPS?"}},
+    {{"topic": "Боевка", "question": "Какая фраза в отзыве описывает боевую систему?"}}
+    ]}}
+
+    Запрос: "составь сводку по игре"
+    Ответ: {{"questions": [
+    {{"topic": "общее впечатление", "question": "Какая фраза в отзыве выражает основное впечатление автора об игре?"}}
+    ]}}
     """
 
         result: Dict[str, Any] = {}
@@ -1270,9 +1285,16 @@ class ReviewProcessor:
         self, batch: List, game: str, user_query: str, query_questions: List[tuple],
     ) -> List[Dict[str, Any]]:
         if self.qa_model is not None:
+            _t0 = time.perf_counter()
             extracted = self._collect_qa_quotes(batch, query_questions)   # ← изменено
             if extracted:
+                _t1 = time.perf_counter()
                 findings = self._categorize_quotes(extracted, game)
+                _t2 = time.perf_counter()
+                logger.info(
+                    "batch(len=%d): qa=%.2fs categorize=%.2fs n=%d",
+                    len(batch), _t1 - _t0, _t2 - _t1, len(extracted),
+                )
                 valid: List[Dict[str, Any]] = []
                 for f in findings:
                     v = _validate_finding(f, batch)
@@ -1286,6 +1308,7 @@ class ReviewProcessor:
                     )
                     _log_map_findings_batch(valid)
                     return valid[:MAP_MAX_QA_PER_BATCH]
+            
             logger.info("QA-путь не дал валидных findings → LLM fallback")
 
         return self._process_batch_llm_only(batch, game, user_query)
@@ -1348,6 +1371,82 @@ class ReviewProcessor:
 
         _log_map_findings_batch(valid)
         return valid[:MAP_MAX_FINDINGS]
+
+    def _extract_qa_spans_batch(
+        self, question: str, contexts: List[str],
+    ) -> List[Optional[Dict[str, Any]]]:
+        if not contexts or self.qa_model is None:
+            return [None] * len(contexts)
+
+        enc = self.qa_tokenizer(
+            [question] * len(contexts),
+            contexts,
+            padding=True,
+            truncation=True,
+            max_length=QA_INPUT_MAX_TOKENS,
+            return_tensors="pt",
+            return_offsets_mapping=True,
+        )
+        device = next(self.qa_model.parameters()).device
+        offsets = enc["offset_mapping"]                    # [N, L, 2]
+        attn = enc["attention_mask"].to(device)            # [N, L]
+        input_ids = enc["input_ids"].to(device)            # [N, L]
+
+        with torch.no_grad():
+            out = self.qa_model(input_ids=input_ids, attention_mask=attn)
+
+        results: List[Optional[Dict[str, Any]]] = []
+
+        for b in range(len(contexts)):
+            seq_ids_b = enc.sequence_ids(b)
+            ctx_mask = torch.tensor(
+                [s == 1 for s in seq_ids_b], dtype=torch.bool, device=device,
+            )
+            if ctx_mask.sum() == 0:
+                results.append(None)
+                continue
+
+            s_log = out.start_logits[b].masked_fill(~ctx_mask, -1e9)
+            e_log = out.end_logits[b].masked_fill(~ctx_mask, -1e9)
+            s_p, e_p = torch.softmax(s_log, -1), torch.softmax(e_log, -1)
+
+            best, best_score = None, -1.0
+            k = min(20, int(ctx_mask.sum()))
+            s_top = torch.topk(s_p, k=k).indices.tolist()
+            e_top = torch.topk(e_p, k=k).indices.tolist()
+
+            for s_idx in s_top:
+                for e_idx in e_top:
+                    if e_idx < s_idx:
+                        continue
+                    if e_idx - s_idx + 1 > QA_MAX_ANSWER_TOKENS:
+                        continue
+                    s_char = offsets[b][s_idx][0].item()
+                    e_char = offsets[b][e_idx][1].item()
+                    if s_char >= e_char:
+                        continue
+                    answer = contexts[b][s_char:e_char].strip()
+                    if not (MIN_QUOTE_LEN <= len(answer) <= MAX_QUOTE_LEN):
+                        continue
+                    score = (s_p[s_idx] * e_p[e_idx]).item()
+                    if score > best_score:
+                        best_score = score
+                        best = {"answer": answer, "score": score, "span": (s_char, e_char)}
+
+            # инверсия + расширение — та же логика, но на contexts[b]
+            if best:
+                s_char, e_char = best["span"]
+                exp_s, exp_e = _expand_span_to_sentence(contexts[b], s_char, e_char)
+                if _has_inversion_right_after(contexts[b], e_char):
+                    expanded = contexts[b][exp_s:exp_e].strip()
+                    if len(expanded) <= MAX_QUOTE_LEN:
+                        best = {"answer": expanded, "score": best["score"] * 0.9,
+                                "span": (exp_s, exp_e)}
+
+            results.append(best if best and best["score"] >= QA_SCORE_THRESHOLD else None)
+
+        return results
+        
 
     def _validate_points(self, points, by_id, existing_features=None):
         valid = []
@@ -1687,7 +1786,7 @@ if __name__ == "__main__":
         encoding="utf-8",
     )
 
-    CACHE_FILE = "cache/89f39112b2b5bba88be145643efe7120.json"
+    CACHE_FILE = "cache/0277ae7107a17da37b37d3c7da99a600.json"
     if len(sys.argv) > 1:
         CACHE_FILE = sys.argv[1]
 
@@ -1706,7 +1805,7 @@ if __name__ == "__main__":
         logger.error("Ошибка чтения файла: %s", e)
         sys.exit(1)
 
-    user_query = "«Составь сводку по Elden Ring"
+    user_query = "«Составь сводку по Elden Ring, сделай упор на крафт"
 
     processor = ReviewProcessor()
     result = processor.process(dm_output, user_query=user_query)

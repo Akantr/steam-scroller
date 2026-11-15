@@ -19,7 +19,7 @@ EMBEDDING_MODEL_NAME = "intfloat/multilingual-e5-small"
 DUPLICATE_THRESHOLD = 0.92  # повышено с 0.85 — защита от схлопывания тематических отзывов
 DEFAULT_MAX_OUTPUT = 200  # повышено с 80 — больше материала для 7 признаков
 MAX_CLUSTERS = 7
-DEFAULT_TARGET_REVIEWS = 1500
+DEFAULT_TARGET_REVIEWS = 2500
 MIN_REVIEWS_FOR_SUMMARY = 30
 MIN_PER_ASPECT = 3  # минимум отзывов на аспект при стратифицированном отборе
 LENGTH_CAP = 1500  # дальше рост длины не даёт роста информативности
@@ -519,7 +519,7 @@ if __name__ == "__main__":
     test_intent = {
         "intent": "analyze_reviews",
         "confidence": 0.98,
-        "target_game": "Where Winds Meet",
+        "target_game": "ELDEN RING",
         "genre_or_tags": [],
         "sub_tasks": [],
         "languages": ["all"],
