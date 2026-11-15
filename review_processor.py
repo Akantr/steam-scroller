@@ -12,7 +12,7 @@ import numpy as np
 import torch
 from transformers import AutoTokenizer, AutoModelForQuestionAnswering
 from rapidfuzz import fuzz
-import ollama
+from ollama import Client as _OllamaClient
 from intent import OllamaManager, OLLAMA_MODEL_NAME
 
 logger = logging.getLogger(__name__)
@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 # ==========================================
 # Конфигурация
 # ==========================================
+OLLAMA_BASE_URL = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 MAP_BATCH_SIZE = 16
 MAP_WORKERS = 1
 MAP_MAX_FINDINGS = 12        # кап LLM-фолбэка
@@ -796,7 +797,8 @@ class ReviewProcessor:
     ):
         self.ollama = ollama_manager if ollama_manager else OllamaManager(model_name=model_name)
         self.model_name = model_name
-        self.ollama_client = ollama
+        # Нативный клиент Ollama с явным base_url (без зависимости от env-переменных).
+        self.ollama_client = _OllamaClient(host=self.ollama.base_url)
         self.batch_size = batch_size
 
         from cloud_llm import CloudLLM, CloudLLMError
@@ -1645,7 +1647,7 @@ sentiment пункта должен соответствовать смыслу 
                     "repeat_penalty": repeat_penalty,
                     "repeat_last_n": 256,
                 }
-                resp = ollama.chat(
+                resp = self.ollama_client.chat(
                     model=self.model_name,
                     messages=[
                         {"role": "system", "content": "Ты возвращаешь только валидный JSON."},

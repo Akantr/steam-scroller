@@ -147,6 +147,13 @@ class InitWorker(QThread):
                 def ollama(self):
                     return self._dm.ollama
 
+                def close(self):
+                    """Освобождает ресурсы DialogManager при закрытии приложения."""
+                    try:
+                        self._dm.close()
+                    except Exception:
+                        pass
+
             dm = GuiDialogManager(db_path=DB_PATH)
             self.ready.emit(dm)
         except Exception as e:
@@ -618,12 +625,32 @@ class MainWindow(QMainWindow):
         if self.init_worker and self.init_worker.isRunning():
             self.init_worker.quit()
             self.init_worker.wait(2000)
-        if self.dm and hasattr(self.dm, "ollama"):
+
+        # Выгружаем модель из памяти Ollama и (если сервер был запущен нами)
+        # полностью останавливаем его через минуту после закрытия приложения.
+        if self.dm:
             try:
-                self.dm.ollama.unload_model()
+                if hasattr(self.dm, "close"):
+                    self.dm.close()
+                elif hasattr(self.dm, "ollama"):
+                    self.dm.ollama.unload_model()
             except Exception:
                 pass
+
+            ollama_mgr = getattr(self.dm, "ollama", None)
+            proc = ollama_mgr.server_process() if hasattr(ollama_mgr, "server_process") else None
+            if proc is not None:
+                QTimer.singleShot(60_000, lambda: self._shutdown_ollama(ollama_mgr))
+
         event.accept()
+
+    @staticmethod
+    def _shutdown_ollama(ollama_mgr):
+        """Через минуту после выхода: выгрузить модель и остановить `ollama serve`."""
+        try:
+            ollama_mgr.stop_server()
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)

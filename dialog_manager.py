@@ -7,7 +7,8 @@ from typing import Any, Dict, List, Optional
 
 from intent import IntentExtractor, OllamaManager, OLLAMA_MODEL_NAME
 from data_manager import DataManager
-from test.review_processor import ReviewProcessor
+# Единый источник кода: корневой review_processor.py (вариант с NUM_CTX=6144)
+from review_processor import ReviewProcessor
 
 logger = logging.getLogger(__name__)
 
@@ -95,10 +96,13 @@ class DialogManager:
         except Exception as e:
             logger.exception("Критическая ошибка в DialogManager")
             return f"Произошла внутренняя ошибка при обработке запроса: {e}"
-            
-        finally:
-            # NFR-006: Выгружаем модель ТОЛЬКО в самом конце, после формирования ответа
+
+    def close(self) -> None:
+        """Выгружает модель из памяти Ollama (вызывается при закрытии приложения)."""
+        try:
             self.ollama.unload_model()
+        except Exception as e:
+            logger.warning(f"Не удалось выгрузить модель при закрытии: {e}")
 
     def _format_response(self, review_result: Dict[str, Any]) -> str:
         """Собирает финальный Markdown-ответ для UI."""

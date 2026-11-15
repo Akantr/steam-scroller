@@ -22,6 +22,9 @@ OLLAMA_MODEL_NAME = "qwen3.8-4b"
 SERVER_START_TIMEOUT_SECONDS = 10
 UNLOAD_TIMEOUT_SECONDS = 5
 RETRY_BACKOFF_BASE_SECONDS = 1.5
+# Должно совпадать с NUM_CTX в review_processor.py — иначе Ollama использует
+# дефолтный контекст (~4096) и обрезает системный промпт/историю.
+NUM_CTX = 6144
 
 _CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
 
@@ -45,6 +48,10 @@ class OllamaManager:
         except requests.exceptions.RequestException:
             return False
 
+    def server_process(self) -> Optional[subprocess.Popen]:
+        """Возвращает Popen-объект запущенного нами сервера `ollama serve` (или None)."""
+        return getattr(self, "_server_proc", None)
+
     def start_server(self) -> None:
         """Запускает Ollama в фоне, если он не запущен."""
         if self.is_running():
@@ -63,7 +70,7 @@ class OllamaManager:
             popen_kwargs["start_new_session"] = True
 
         try:
-            subprocess.Popen(["ollama", "serve"], **popen_kwargs)
+            self._server_proc = subprocess.Popen(["ollama", "serve"], **popen_kwargs)
         except FileNotFoundError as e:
             raise RuntimeError(
                 "Бинарник 'ollama' не найден в PATH. Установите Ollama: "
@@ -95,6 +102,29 @@ class OllamaManager:
             logger.debug(f"Модель {self.model_name} выгружена из памяти.")
         except Exception as e:
             logger.warning(f"Не удалось выгрузить модель {self.model_name}: {e}")
+
+    def stop_server(self, terminate_timeout: float = 5.0) -> None:
+        """
+        Полностью останавливает сервер `ollama serve`, если он был запущен
+        этим приложением (запущенный вручную/системой сервер не трогается).
+        Сначала выгружает модель, затем завершает процесс.
+        """
+        self.unload_model()
+
+        proc = getattr(self, "_server_proc", None)
+        if proc is None or proc.poll() is not None:
+            return
+
+        logger.info("Остановка запущенного приложением сервера Ollama...")
+        try:
+            proc.terminate()
+            try:
+                proc.wait(timeout=terminate_timeout)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=terminate_timeout)
+        except Exception as e:
+            logger.warning(f"Не удалось остановить сервер Ollama: {e}")
 
     def close(self) -> None:
         """Освобождает ресурсы (выгружает модель)."""
@@ -229,6 +259,19 @@ class IntentExtractor:
                     temperature=0.0,
                     max_tokens=1024,
                     response_format={"type": "json_object"},
+                    # OpenAI-совместимый эндпоинт Ollama по умолчанию использует
+                    # num_ctx ~4096 и обрезает системный промпт → параметры intent
+                    # извлекаются неверно. Задаем контекст явно (как в review_processor).
+                    extra_body={
+                        "options": {
+                            "num_ctx": NUM_CTX,
+                            "temperature": 0.0,
+                            "repeat_penalty": 1.3,
+                            "repeat_last_n": 256,
+                        },
+                        "think": False,
+                        "keep_alive": "30m",
+                    },
                 )
                 raw = response.choices[0].message.content or ""
                 cleaned = self._strip_code_fences(raw)
