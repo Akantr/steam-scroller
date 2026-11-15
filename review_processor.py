@@ -46,6 +46,28 @@ MAP_MAX_QA_PER_BATCH = 32       # сколько цитат берём с бат
 MAP_CATEGORIZE_SUB_BATCH = 12   # саббатч для Qwen-категоризации
 MAP_CATEGORIZE_NUM_PREDICT = 2048    
 
+# --- Query reformulation ---
+QUERY_MAX_QUESTIONS = 2
+QUERY_REFORMULATE_NUM_PREDICT = 512
+
+QUERY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "questions": {
+            "type": "array", "minItems": 1, "maxItems": QUERY_MAX_QUESTIONS,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "topic":    {"type": "string"},
+                    "question": {"type": "string"},
+                },
+                "required": ["topic", "question"],
+            },
+        },
+    },
+    "required": ["questions"],
+}
+
 SUMMARY_SCHEMA = {
     "type": "object",
     "properties": {
@@ -65,6 +87,21 @@ SUMMARY_SCHEMA = {
     },
     "required": ["summary_points"],
 }
+
+# Единственный «беззапросный» вопрос. topic=None → fallback-категоризация
+# в _categorize_sub_batch для этого случая работать не будет — это осознанный
+# компромисс (Qwen обычно покрывает 32/32, см. ваш run.log).
+GENERIC_QA_QUESTIONS = [
+    ("Какая фраза в отзыве описывает сильные стороны игры?", None),
+    ("Какая фраза в отзыве описывает слабые стороны игры?", None),
+]
+
+"""
+CONSTANT_QA_QUESTION = (
+    "Какая фраза в отзыве выражает основное впечатление автора об игре?",
+    None,
+)
+"""
 
 UMBRELLA_ANCHORS = {
     "Боевка":       "Боевка: боевая система, комбо, парирование, оружие, сражения",
@@ -959,10 +996,13 @@ class ReviewProcessor:
             return best
         return None
 
-    def _collect_qa_quotes(self, batch: List, user_query: str) -> List[Dict[str, Any]]:
+    def _collect_qa_quotes(
+        self, batch: List, query_questions: List[tuple],
+    ) -> List[Dict[str, Any]]:
         if self.qa_model is None:
             return []
-        questions = self._generate_questions_for_qa(user_query)
+        questions = self._generate_questions_for_qa(query_questions)
+        query_topics = {t.lower() for _, t in query_questions if t}
         collected: List[Dict[str, Any]] = []
 
         for i, review in enumerate(batch, 1):
@@ -973,7 +1013,7 @@ class ReviewProcessor:
             if not review_text:
                 continue
             seen_spans: set = set()
-            for q_idx, (q, topic_hint) in enumerate(questions):
+            for q, topic_hint in questions:                     # ← без q_idx
                 r = self._extract_qa_span(q, review_text)
                 if not r:
                     continue
@@ -982,15 +1022,18 @@ class ReviewProcessor:
                     continue
                 seen_spans.add(span)
 
-                boost = 1.15 if (user_query and q_idx == 0) else 1.0
-                length_factor = 0.85 + 0.30 * min(len(r["answer"]), MAX_QUOTE_LEN) / MAX_QUOTE_LEN
+                # буст по теме, а не по позиции вопроса
+                boost = 1.15 if (topic_hint and topic_hint.lower() in query_topics) else 1.0
+                length_factor = (
+                    0.85 + 0.30 * min(len(r["answer"]), MAX_QUOTE_LEN) / MAX_QUOTE_LEN
+                )
 
                 collected.append({
                     "source_id": i,
                     "quote": r["answer"],
                     "span": span,
                     "_qa_score": r["score"] * boost * length_factor,
-                    "_qa_topic": topic_hint,   # ← тема из вопроса
+                    "_qa_topic": topic_hint,
                 })
 
         collected.sort(key=lambda x: -x["_qa_score"])
@@ -1080,9 +1123,13 @@ class ReviewProcessor:
 
 
     # ---------- Map ----------
-    def _map_reviews(
-        self, reviews: List, game: str, user_query: str
-    ) -> List[Dict[str, Any]]:
+    def _map_reviews(self, reviews, game, user_query):
+        query_questions = self._reformulate_query(user_query)
+        if query_questions:
+            logger.info("Query-reformulated: %s", [t for _, t in query_questions])
+        elif user_query:
+            logger.info("Query-reformulated: пусто → CONSTANT_QA_QUESTION")
+
         batches = [
             reviews[i : i + self.batch_size]
             for i in range(0, len(reviews), self.batch_size)
@@ -1091,7 +1138,9 @@ class ReviewProcessor:
 
         with ThreadPoolExecutor(max_workers=MAP_WORKERS) as executor:
             futures = {
-                executor.submit(self._process_batch_safe, b, game, user_query): b
+                executor.submit(
+                    self._process_batch_safe, b, game, user_query, query_questions,
+                ): b
                 for b in batches
             }
             for future in as_completed(futures):
@@ -1107,13 +1156,23 @@ class ReviewProcessor:
         _normalize_topics_batch(all_findings)
         logger.info("Map-этап собрал %d фактов.", len(all_findings))
         _dump_calibration_findings(all_findings)
+
+        # опционально: сигнал «запроса нет в отзывах»
+        if query_questions and not any(
+            _matches_feature(f, t) for f in all_findings for _, t in query_questions
+        ):
+            logger.info(
+                "Запрос %r: темы %s не найдены среди %d findings",
+                user_query, [t for _, t in query_questions], len(all_findings),
+            )
+
         return all_findings
 
     def _process_batch_safe(
-        self, batch: List, game: str, user_query: str
+        self, batch: List, game: str, user_query: str, query_questions: List[tuple],
     ) -> List[Dict[str, Any]]:
         try:
-            return self._process_batch(batch, game, user_query)
+            return self._process_batch(batch, game, user_query, query_questions)
         except LLMJSONError as e:
             if len(batch) <= 1:
                 logger.warning("Split-retry: единственный отзыв не дал JSON (%s). Дроп.", e)
@@ -1121,37 +1180,97 @@ class ReviewProcessor:
             mid = len(batch) // 2
             logger.info("Split-retry: %d -> %d + %d", len(batch), mid, len(batch) - mid)
             return (
-                self._process_batch_safe(batch[:mid], game, user_query)
-                + self._process_batch_safe(batch[mid:], game, user_query)
+                self._process_batch_safe(batch[:mid], game, user_query, query_questions)
+                + self._process_batch_safe(batch[mid:], game, user_query, query_questions)
             )
 
-    def _generate_questions_for_qa(self, user_query: str) -> List[tuple]:
-        if user_query:
-            return [(f"Какая фраза в отзыве на игру подтверждает: {user_query}?", None)]
-        return [
-            ("Какая фраза в отзыве описывает боевую систему, комбо или оружие?", "Боевка"),
-            ("Какая фраза в отзыве описывает сюжет, историю или лор?",         "Сюжет"),
-            ("Какая фраза в отзыве описывает графику, арт или анимации?",      "Графика"),
-            ("Какая фраза в отзыве описывает музыку, звук или озвучку?",       "Звук"),
-            ("Какая фраза в отзыве описывает оптимизацию, FPS или стабильность?","Оптимизация"),
-            ("Какая фраза в отзыве описывает сложность или челлендж?",         "Сложность"),
-            ("Какая фраза в отзыве описывает баги, вылеты или глитчи?",        "Баги"),
-            ("Какая фраза в отзыве описывает цену или соотношение цена/качество?","Цена"),
-            ("Какая фраза в отзыве описывает боссов или боссфайты?",           "Боссы"),
-            ("Какая фраза в отзыве описывает прогрессию, прокачку или развитие?","Прогрессия"),
-            ("Какая фраза в отзыве описывает атмосферу или настроение?", "Атмосфера"),
-            ("Какая фраза в отзыве описывает исследование мира?", "Исследование"),
-            ("Какая фраза в отзыве описывает вариативность прохождения или билды?", "Вариативность"),
-            ("Какая фраза в отзыве описывает сообщество или разработчиков?", "Сообщество"),
-            ("Какая фраза в отзыве описывает мультиплеер или кооператив?", "Геймплей"),
-        ]
+    def _reformulate_query(self, user_query: str) -> List[tuple]:
+        """user_query → [(question, topic), ...], ≤ QUERY_MAX_QUESTIONS.
+        Пустой список = использовать CONSTANT_QA_QUESTION."""
+        if not user_query or not user_query.strip():
+            return []
+
+        prompt = f"""
+    Ты — аналитик отзывов Steam. Пользователь задал запрос:
+    "{user_query}"
+
+    Преврати запрос в 1–2 вопроса для extractive-QA модели (SQuAD-стиль).
+
+    ПРАВИЛА:
+    1. Каждый вопрос ОБЯЗАН начинаться с "Какая фраза в отзыве" и заканчиваться "?".
+    Запрещены yes/no ("есть ли...", "хороша ли...", "стоит ли...").
+    Запрещены общие вопросы ("что говорят об игре").
+    2. "topic" — короткое название темы (1–3 слова), ДОЛЖНО встречаться в "question"
+    как подстрока. Тема может быть ЛЮБОЙ (крафт, кооператив, вес оружия,
+    интерфейс) — не ограничивайся типовыми категориями.
+    3. Если запрос составной ("боевка и оптимизация") — верни 2 вопроса.
+    Первым — то, что в запросе важнее.
+    4. Если запрос слишком общий — верни ровно один:
+    {{"topic": "общее впечатление",
+        "question": "Какая фраза в отзыве выражает основное впечатление автора об игре?"}}
+    5. Не выдумывай темы, которых в запросе нет.
+
+    Верни строго JSON:
+    {{"questions": [{{"topic": "Боевка",
+                    "question": "Какая фраза в отзыве описывает боевую систему?"}}]}}
+    """
+
+        result: Dict[str, Any] = {}
+
+        # 1) cloud — быстрее, не грузит GPU перед QA
+        if self.cloud is not None and self.cloud.enabled:
+            try:
+                result = self.cloud.chat_json(prompt, QUERY_SCHEMA, "query_reformulate")
+            except self._CloudLLMError as e:
+                logger.warning("Query-reformulate (cloud) failed: %s → local", e)
+
+        # 2) local Qwen
+        if not result:
+            try:
+                result = self._call_llm(
+                    prompt, "Query-reformulate",
+                    num_predict=QUERY_REFORMULATE_NUM_PREDICT,
+                )
+            except Exception as e:
+                logger.warning("Query-reformulate (local) failed: %s → CONSTANT", e)
+                return []
+
+        # 3) пост-валидация формата (SQuAD + topic ⊆ question)
+        out: List[tuple] = []
+        for q in result.get("questions", [])[:QUERY_MAX_QUESTIONS]:
+            if not isinstance(q, dict):
+                continue
+            topic = _coerce_topic(q.get("topic"))
+            question = _coerce_topic(q.get("question"))
+            if not topic:
+                continue
+            if (not question.endswith("?")
+                    or "отзыв" not in question.lower()
+                    or topic.lower() not in question.lower()):
+                question = f"Какая фраза в отзыве описывает {topic}?"
+            out.append((question, topic))
+        return out
+    
+    #def _generate_questions_for_qa(self, query_questions: List[tuple]) -> List[tuple]:
+    #"""Единая точка. Без запроса — 1 CONSTANT, с запросом — 1–2 из LLM."""
+    #if query_questions:
+    #    return query_questions
+    #return [CONSTANT_QA_QUESTION]
+
+    def _generate_questions_for_qa(self, query_questions: List[tuple]) -> List[tuple]:
+        if not query_questions:
+            return GENERIC_QA_QUESTIONS
+        # LLM вернул fallback «общее впечатление» → тоже 2 catch-all
+        generic_topics = {"", "общее впечатление", "общее"}
+        if all((t or "").strip().lower() in generic_topics for _, t in query_questions):
+            return GENERIC_QA_QUESTIONS
+        return query_questions
 
     def _process_batch(
-        self, batch: List, game: str, user_query: str
+        self, batch: List, game: str, user_query: str, query_questions: List[tuple],
     ) -> List[Dict[str, Any]]:
-        # === Путь 1: Extractive QA + LLM-категоризация ===
         if self.qa_model is not None:
-            extracted = self._collect_qa_quotes(batch, user_query)
+            extracted = self._collect_qa_quotes(batch, query_questions)   # ← изменено
             if extracted:
                 findings = self._categorize_quotes(extracted, game)
                 valid: List[Dict[str, Any]] = []
@@ -1169,7 +1288,6 @@ class ReviewProcessor:
                     return valid[:MAP_MAX_QA_PER_BATCH]
             logger.info("QA-путь не дал валидных findings → LLM fallback")
 
-        # === Путь 2: LLM-фолбэк ===
         return self._process_batch_llm_only(batch, game, user_query)
 
     def _process_batch_llm_only(
