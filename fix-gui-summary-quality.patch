@@ -1,0 +1,226 @@
+From ccda46bf7b57f3aaa3e45814558f3c4d3a2847b5 Mon Sep 17 00:00:00 2001
+From: "qwen.ai[bot]" <qwenlm-intl@service.alibaba.com>
+Date: Sun, 15 Nov 2026 13:19:18 +0000
+Subject: [PATCH] Fix GUI summary quality: explicit num_ctx in intent client,
+ unified review_processor import, native ollama client, model unload/server
+ shutdown on app close
+
+---
+ dialog_manager.py   | 12 ++++++++----
+ intent.py           | 45 ++++++++++++++++++++++++++++++++++++++++++++-
+ main_gui.py         | 31 +++++++++++++++++++++++++++++--
+ review_processor.py |  8 +++++---
+ 4 files changed, 86 insertions(+), 10 deletions(-)
+
+diff --git a/dialog_manager.py b/dialog_manager.py
+index 53e8a1d..33fef93 100644
+--- a/dialog_manager.py
++++ b/dialog_manager.py
+@@ -7,7 +7,8 @@ from typing import Any, Dict, List, Optional
+ 
+ from intent import IntentExtractor, OllamaManager, OLLAMA_MODEL_NAME
+ from data_manager import DataManager
+-from test.review_processor import ReviewProcessor
++# Единый источник кода: корневой review_processor.py (вариант с NUM_CTX=6144)
++from review_processor import ReviewProcessor
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -95,10 +96,13 @@ class DialogManager:
+         except Exception as e:
+             logger.exception("Критическая ошибка в DialogManager")
+             return f"Произошла внутренняя ошибка при обработке запроса: {e}"
+-            
+-        finally:
+-            # NFR-006: Выгружаем модель ТОЛЬКО в самом конце, после формирования ответа
++
++    def close(self) -> None:
++        """Выгружает модель из памяти Ollama (вызывается при закрытии приложения)."""
++        try:
+             self.ollama.unload_model()
++        except Exception as e:
++            logger.warning(f"Не удалось выгрузить модель при закрытии: {e}")
+ 
+     def _format_response(self, review_result: Dict[str, Any]) -> str:
+         """Собирает финальный Markdown-ответ для UI."""
+diff --git a/intent.py b/intent.py
+index fd89c8d..7ae4859 100644
+--- a/intent.py
++++ b/intent.py
+@@ -22,6 +22,9 @@ OLLAMA_MODEL_NAME = "qwen3.8-4b"
+ SERVER_START_TIMEOUT_SECONDS = 10
+ UNLOAD_TIMEOUT_SECONDS = 5
+ RETRY_BACKOFF_BASE_SECONDS = 1.5
++# Должно совпадать с NUM_CTX в review_processor.py — иначе Ollama использует
++# дефолтный контекст (~4096) и обрезает системный промпт/историю.
++NUM_CTX = 6144
+ 
+ _CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
+ 
+@@ -45,6 +48,10 @@ class OllamaManager:
+         except requests.exceptions.RequestException:
+             return False
+ 
++    def server_process(self) -> Optional[subprocess.Popen]:
++        """Возвращает Popen-объект запущенного нами сервера `ollama serve` (или None)."""
++        return getattr(self, "_server_proc", None)
++
+     def start_server(self) -> None:
+         """Запускает Ollama в фоне, если он не запущен."""
+         if self.is_running():
+@@ -63,7 +70,7 @@ class OllamaManager:
+             popen_kwargs["start_new_session"] = True
+ 
+         try:
+-            subprocess.Popen(["ollama", "serve"], **popen_kwargs)
++            self._server_proc = subprocess.Popen(["ollama", "serve"], **popen_kwargs)
+         except FileNotFoundError as e:
+             raise RuntimeError(
+                 "Бинарник 'ollama' не найден в PATH. Установите Ollama: "
+@@ -96,6 +103,29 @@ class OllamaManager:
+         except Exception as e:
+             logger.warning(f"Не удалось выгрузить модель {self.model_name}: {e}")
+ 
++    def stop_server(self, terminate_timeout: float = 5.0) -> None:
++        """
++        Полностью останавливает сервер `ollama serve`, если он был запущен
++        этим приложением (запущенный вручную/системой сервер не трогается).
++        Сначала выгружает модель, затем завершает процесс.
++        """
++        self.unload_model()
++
++        proc = getattr(self, "_server_proc", None)
++        if proc is None or proc.poll() is not None:
++            return
++
++        logger.info("Остановка запущенного приложением сервера Ollama...")
++        try:
++            proc.terminate()
++            try:
++                proc.wait(timeout=terminate_timeout)
++            except subprocess.TimeoutExpired:
++                proc.kill()
++                proc.wait(timeout=terminate_timeout)
++        except Exception as e:
++            logger.warning(f"Не удалось остановить сервер Ollama: {e}")
++
+     def close(self) -> None:
+         """Освобождает ресурсы (выгружает модель)."""
+         self.unload_model()
+@@ -229,6 +259,19 @@ class IntentExtractor:
+                     temperature=0.0,
+                     max_tokens=1024,
+                     response_format={"type": "json_object"},
++                    # OpenAI-совместимый эндпоинт Ollama по умолчанию использует
++                    # num_ctx ~4096 и обрезает системный промпт → параметры intent
++                    # извлекаются неверно. Задаем контекст явно (как в review_processor).
++                    extra_body={
++                        "options": {
++                            "num_ctx": NUM_CTX,
++                            "temperature": 0.0,
++                            "repeat_penalty": 1.3,
++                            "repeat_last_n": 256,
++                        },
++                        "think": False,
++                        "keep_alive": "30m",
++                    },
+                 )
+                 raw = response.choices[0].message.content or ""
+                 cleaned = self._strip_code_fences(raw)
+diff --git a/main_gui.py b/main_gui.py
+index 0816a33..43380fd 100644
+--- a/main_gui.py
++++ b/main_gui.py
+@@ -147,6 +147,13 @@ class InitWorker(QThread):
+                 def ollama(self):
+                     return self._dm.ollama
+ 
++                def close(self):
++                    """Освобождает ресурсы DialogManager при закрытии приложения."""
++                    try:
++                        self._dm.close()
++                    except Exception:
++                        pass
++
+             dm = GuiDialogManager(db_path=DB_PATH)
+             self.ready.emit(dm)
+         except Exception as e:
+@@ -618,13 +625,33 @@ class MainWindow(QMainWindow):
+         if self.init_worker and self.init_worker.isRunning():
+             self.init_worker.quit()
+             self.init_worker.wait(2000)
+-        if self.dm and hasattr(self.dm, "ollama"):
++
++        # Выгружаем модель из памяти Ollama и (если сервер был запущен нами)
++        # полностью останавливаем его через минуту после закрытия приложения.
++        if self.dm:
+             try:
+-                self.dm.ollama.unload_model()
++                if hasattr(self.dm, "close"):
++                    self.dm.close()
++                elif hasattr(self.dm, "ollama"):
++                    self.dm.ollama.unload_model()
+             except Exception:
+                 pass
++
++            ollama_mgr = getattr(self.dm, "ollama", None)
++            proc = ollama_mgr.server_process() if hasattr(ollama_mgr, "server_process") else None
++            if proc is not None:
++                QTimer.singleShot(60_000, lambda: self._shutdown_ollama(ollama_mgr))
++
+         event.accept()
+ 
++    @staticmethod
++    def _shutdown_ollama(ollama_mgr):
++        """Через минуту после выхода: выгрузить модель и остановить `ollama serve`."""
++        try:
++            ollama_mgr.stop_server()
++        except Exception:
++            pass
++
+ if __name__ == "__main__":
+     app = QApplication(sys.argv)
+     app.setStyle("Fusion")
+diff --git a/review_processor.py b/review_processor.py
+index 907f9a7..e0c1b41 100644
+--- a/review_processor.py
++++ b/review_processor.py
+@@ -12,7 +12,7 @@ import numpy as np
+ import torch
+ from transformers import AutoTokenizer, AutoModelForQuestionAnswering
+ from rapidfuzz import fuzz
+-import ollama
++from ollama import Client as _OllamaClient
+ from intent import OllamaManager, OLLAMA_MODEL_NAME
+ 
+ logger = logging.getLogger(__name__)
+@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
+ # ==========================================
+ # Конфигурация
+ # ==========================================
++OLLAMA_BASE_URL = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+ MAP_BATCH_SIZE = 16
+ MAP_WORKERS = 1
+ MAP_MAX_FINDINGS = 12        # кап LLM-фолбэка
+@@ -796,7 +797,8 @@ class ReviewProcessor:
+     ):
+         self.ollama = ollama_manager if ollama_manager else OllamaManager(model_name=model_name)
+         self.model_name = model_name
+-        self.ollama_client = ollama
++        # Нативный клиент Ollama с явным base_url (без зависимости от env-переменных).
++        self.ollama_client = _OllamaClient(host=self.ollama.base_url)
+         self.batch_size = batch_size
+ 
+         from cloud_llm import CloudLLM, CloudLLMError
+@@ -1645,7 +1647,7 @@ sentiment пункта должен соответствовать смыслу
+                     "repeat_penalty": repeat_penalty,
+                     "repeat_last_n": 256,
+                 }
+-                resp = ollama.chat(
++                resp = self.ollama_client.chat(
+                     model=self.model_name,
+                     messages=[
+                         {"role": "system", "content": "Ты возвращаешь только валидный JSON."},
+-- 
+2.39.5
+
