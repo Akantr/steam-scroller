@@ -53,6 +53,8 @@ def normalize_intent(intent_data: Dict[str, Any]) -> Dict[str, Any]:
         normalized["purchase_type"] = "all"
     if not normalized.get("sort_by"):
         normalized["sort_by"] = "helpful"
+    if not normalized.get("target_count"):
+        normalized["target_count"] = DEFAULT_TARGET_REVIEWS
 
     time_text = normalized.get("time_filter_text")
     time_params = steam_api.parse_time_filter(time_text)
@@ -349,11 +351,16 @@ class DataManager:
             return _make_error(f"Ошибка Steam API: {e}")
 
         # ШАГ 4. ПРОВЕРКА КЭША
+        target_count = min(
+            int(normalized.get("target_count") or DEFAULT_TARGET_REVIEWS),
+            steam_api.MAX_REVIEWS_TARGET,
+        )
+
         cache_key = self._get_cache_key(
             appid,
             target_game,
             normalized,
-            target_count=DEFAULT_TARGET_REVIEWS,
+            target_count=target_count,
             max_output=self.max_output,
         )
         cache_file = os.path.join(self.cache_dir, f"{cache_key}.json")
@@ -401,7 +408,7 @@ class DataManager:
         # ШАГ 5. СБОР ОТЗЫВОВ
         try:
             fetch = steam_api.fetch_reviews_new_api(
-                appid, normalized, target_count=DEFAULT_TARGET_REVIEWS,
+                appid, normalized, target_count=target_count,
             )
         except steam_api.SteamAPIError as e:
             return _make_error(f"Не удалось загрузить отзывы: {e}")

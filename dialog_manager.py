@@ -4,10 +4,11 @@ import os
 import sqlite3
 from datetime import datetime
 from typing import Any, Dict, List, Optional
+from openai import OpenAI
 
 from intent import IntentExtractor, OllamaManager, OLLAMA_MODEL_NAME
 from data_manager import DataManager
-from test.review_processor import ReviewProcessor
+from review_processor import ReviewProcessor
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +69,17 @@ class DialogManager:
             intent_data = self.intent_extractor.extract_intent(user_query, history=history)
             logger.debug(f"Извлечен intent: {intent_data}")
 
+            text_intent = intent_data.get("intent")
+            if text_intent in ("free_talk", "clarify", "unknown"):
+                logger.info("Обработка текстового intent=%s", text_intent)
+                final_response = self._generate_text_response(
+                    intent_data,
+                    user_query,
+                    history=history,
+                )
+                self._save_to_journal(user_query, "None", final_response)
+                return final_response
+
             # Шаг 2: Получение данных (Data Manager)
             # Внутри DataManager происходит проверка кэша, запрос к Steam API и семантическая фильтрация
             dm_output = self.data_manager.process(intent_data)
@@ -100,6 +112,94 @@ class DialogManager:
             # NFR-006: Выгружаем модель ТОЛЬКО в самом конце, после формирования ответа
             self.ollama.unload_model()
 
+    def close(self) -> None:
+        """Выгружает модель из памяти Ollama (вызывается при закрытии приложения)."""
+        try:
+            self.ollama.unload_model()
+        except Exception as e:
+            logger.warning(f"Не удалось выгрузить модель при закрытии: {e}")
+
+    def _generate_text_response(
+        self,
+        intent_data: Dict[str, Any],
+        user_query: str,
+        history: Optional[List[Dict[str, str]]] = None,
+    ) -> str:
+        intent = intent_data.get("intent")
+        missing_slots = intent_data.get("missing_slots") or []
+        missing_text = ", ".join(str(slot) for slot in missing_slots)
+
+        if intent == "clarify":
+            system_prompt = (
+                "Ты — помощник приложения для анализа отзывов Steam. "
+                "Кратко и по-человечески попроси пользователя уточнить недостающие данные."
+            )
+            user_prompt = (
+                f"Запрос пользователя: {user_query}\n"
+                f"Не заполнены поля: {missing_text or 'название игры'}\n"
+                "Задай только необходимые уточнения. Не анализируй отзывы и не выдумывай название игры."
+            )
+        elif intent == "unknown":
+            system_prompt = (
+                "Ты — помощник приложения для анализа отзывов Steam. "
+                "Вежливо сообщи, что запрос не понят, и предложи конкретные примеры анализа отзывов."
+            )
+            user_prompt = (
+                f"Запрос пользователя: {user_query}\n"
+                "Ответь кратко на русском: объясни, что запрос нужно сформулировать яснее."
+            )
+        else:
+            system_prompt = (
+                "Ты — дружелюбный ассистент приложения для анализа отзывов Steam. "
+                "Отвечай естественно на русском, кратко и без выдуманных данных."
+            )
+            user_prompt = (
+                f"Запрос пользователя: {user_query}\n"
+                "Это свободный разговор. Ответь на запрос пользователя по смыслу."
+            )
+
+        cloud = getattr(self.review_processor, "cloud", None)
+        if cloud is not None:
+            try:
+                return cloud.chat_text(
+                    system_prompt,
+                    user_prompt,
+                    history=history,
+                )
+            except Exception as e:
+                logger.warning("Облачная генерация текстового ответа недоступна: %s", e)
+
+        try:
+            client = OpenAI(
+                base_url=self.ollama.client_url,
+                api_key="ollama",
+                timeout=25.0,
+            )
+            messages = [{"role": "system", "content": system_prompt}]
+            if history:
+                messages.extend(history[-3:])
+            messages.append({"role": "user", "content": user_prompt})
+            response = client.chat.completions.create(
+                model=self.ollama.model_name,
+                messages=messages,
+                temperature=0.3,
+                max_tokens=700,
+            )
+            text = (response.choices[0].message.content or "").strip()
+            if text:
+                return text
+        except Exception as e:
+            logger.warning("Локальная генерация текстового ответа недоступна: %s", e)
+
+        if intent == "clarify":
+            return "Уточните, пожалуйста, название игры, отзывы которой нужно проанализировать."
+        if intent == "unknown":
+            return (
+                "Я не смог понять запрос. Укажите название игры, например: "
+                "«Составь сводку по отзывам Elden Ring за последний месяц»."
+            )
+        return "Здравствуйте! Чем могу помочь?"
+    
     def _format_response(self, review_result: Dict[str, Any]) -> str:
         """Собирает финальный Markdown-ответ для UI."""
         if review_result.get("status") != "success":

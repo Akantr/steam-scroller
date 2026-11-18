@@ -22,6 +22,7 @@ OLLAMA_MODEL_NAME = "qwen3.8-4b"
 SERVER_START_TIMEOUT_SECONDS = 10
 UNLOAD_TIMEOUT_SECONDS = 5
 RETRY_BACKOFF_BASE_SECONDS = 1.5
+NUM_CTX = 6144
 
 _CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
 
@@ -63,7 +64,7 @@ class OllamaManager:
             popen_kwargs["start_new_session"] = True
 
         try:
-            subprocess.Popen(["ollama", "serve"], **popen_kwargs)
+            self._server_proc = subprocess.Popen(["ollama", "serve"], **popen_kwargs)
         except FileNotFoundError as e:
             raise RuntimeError(
                 "Бинарник 'ollama' не найден в PATH. Установите Ollama: "
@@ -96,6 +97,33 @@ class OllamaManager:
         except Exception as e:
             logger.warning(f"Не удалось выгрузить модель {self.model_name}: {e}")
 
+    def server_process(self) -> Optional[subprocess.Popen]:
+        """Возвращает Popen-объект запущенного нами сервера `ollama serve` (или None)."""
+        return getattr(self, "_server_proc", None)
+
+    def stop_server(self, terminate_timeout: float = 5.0) -> None:
+        """
+        Полностью останавливает сервер `ollama serve`, если он был запущен
+        этим приложением (запущенный вручную/системой сервер не трогается).
+        Сначала выгружает модель, затем завершает процесс.
+        """
+        self.unload_model()
+
+        proc = getattr(self, "_server_proc", None)
+        if proc is None or proc.poll() is not None:
+            return
+
+        logger.info("Остановка запущенного приложением сервера Ollama...")
+        try:
+            proc.terminate()
+            try:
+                proc.wait(timeout=terminate_timeout)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=terminate_timeout)
+        except Exception as e:
+            logger.warning(f"Не удалось остановить сервер Ollama: {e}")
+
     def close(self) -> None:
         """Освобождает ресурсы (выгружает модель)."""
         self.unload_model()
@@ -122,7 +150,8 @@ class IntentOutput(BaseModel):
     languages: Optional[List[str]] = None
     review_type: Optional[Literal["positive", "negative", "all"]] = None
     purchase_type: Optional[Literal["steam", "non_steam_purchase", "all"]] = None
-    sort_by: Optional[Literal["helpful", "recent", "updated"]] = None
+    # ↓ добавлен "funny"
+    sort_by: Optional[Literal["helpful", "recent", "updated", "funny"]] = None
 
     time_filter_text: Optional[str] = None
     min_playtime_hours: Optional[int] = None
@@ -131,6 +160,9 @@ class IntentOutput(BaseModel):
     hardware_os: Optional[Literal["windows", "mac", "linux"]] = None
     hardware_cpu: Optional[str] = None
     hardware_gpu: Optional[str] = None
+
+    # ↓ НОВОЕ: сколько сырых отзывов тянем из Steam (до очистки и семантики)
+    target_count: Optional[int] = Field(None, ge=1)
 
     missing_slots: List[str] = Field(default_factory=list)
     data_retrieval_needed: bool
@@ -159,12 +191,13 @@ class IntentExtractor:
 5. languages: массив языков на английском (например, ["russian"], ["japanese", "english"]). Если не указано — null.
 6. review_type: строго одно из ["positive", "negative", "all"] или null.
 7. purchase_type: строго одно из ["steam", "non_steam_purchase", "all"] или null.
-8. sort_by: строго одно из ["helpful", "recent", "updated"] или null.
+8. sort_by: строго одно из  ["helpful", "recent", "updated", "funny"] или null.
 9. time_filter_text: извлекай время текстом, как в запросе (например, "last month", "2023", "last week"). Если времени нет — null.
 10. hardware_os: если просят игру для ПК/Windows ставь "windows", для Mac — "mac", для Linux — "linux". Иначе null.
 11. hardware_cpu / hardware_gpu: если явно указана модель (например, "RTX 4090") — запиши текстом, иначе null.
 12. data_retrieval_needed: true, если intent = analyze_reviews или rank_games. false для free_talk, clarify, unknown.
 13. confidence: число от 0.0 до 1.0. Насколько ты уверен в определении intent.
+14. target_count: количество отзывов для загрузки — целое число. Указывай ТОЛЬКО если пользователь явно назвал число ("возьми 500 отзывов", "проанализируй 1000 отзывов"), иначе null.
 
 ПРИМЕРЫ:
 Запрос: "Сделай сводку по русским отзывам Elden Ring за последний месяц и выведи таблицу"
@@ -179,6 +212,8 @@ class IntentExtractor:
 Запрос: "AMD Ryzen 5 7535HS, Satisfactory."
 Ответ: {"intent": "analyze_reviews", "confidence": 0.98, "target_game": "Satisfactory", "genre_or_tags": [], "sub_tasks": [], "languages": null, "review_type": null, "purchase_type": null, "sort_by": null, "time_filter_text": null, "min_playtime_hours": null, "max_playtime_hours": null, "hardware_os": null, "hardware_cpu": "AMD Ryzen 5 7535HS", "hardware_gpu": null, "missing_slots": [], "data_retrieval_needed": true}
 
+Запрос: "Проанализируй 500 отзывов Elden Ring, самые смешные"
+Ответ: {"intent": "analyze_reviews", "confidence": 0.97, "target_game": "Elden Ring", "genre_or_tags": [], "sub_tasks": [], "languages": null, "review_type": null, "purchase_type": null, "sort_by": "funny", "time_filter_text": null, "min_playtime_hours": null, "max_playtime_hours": null, "hardware_os": null, "hardware_cpu": null, "hardware_gpu": null, "target_count": 500, "missing_slots": [], "data_retrieval_needed": true}
 Верни только JSON.
 """
 
@@ -229,6 +264,17 @@ class IntentExtractor:
                     temperature=0.0,
                     max_tokens=1024,
                     response_format={"type": "json_object"},
+                    # ↓ добавить
+                    extra_body={
+                        "options": {
+                            "num_ctx": NUM_CTX,
+                            "temperature": 0.0,
+                            "repeat_penalty": 1.3,
+                            "repeat_last_n": 256,
+                        },
+                        "think": False,
+                        "keep_alive": "30m",
+                    },
                 )
                 raw = response.choices[0].message.content or ""
                 cleaned = self._strip_code_fences(raw)

@@ -3,6 +3,7 @@ import logging
 import time
 import urllib.parse
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
 from typing import Any, Dict, List, Optional
 from rapidfuzz import fuzz, process as fuzz_process
 import re
@@ -36,7 +37,7 @@ PURCHASE_TYPE_MAP = {
     "non_steam_purchase": 2,
 }
 
-MAX_REVIEWS_TARGET = 3000
+MAX_REVIEWS_TARGET = 7000
 PAGE_SIZE = 100
 MAX_PAGES = 30
 MAX_DAY_RANGE = 365
@@ -303,14 +304,33 @@ def fetch_reviews_new_api(
         normalized_params.get("purchase_type", "all"), 1
     )
 
-    # Временной фильтр: day_range применяется только к Helpful
+    # Временной фильтр.
+    # Steam API принимает day_range только для sort_by == "helpful".
+    # Для остальных сортировок конвертируем day_range в date_range_start/end,
+    # чтобы фильтр по времени не терялся.
     day_range = normalized_params.get("day_range", 0)
-    if sort_by == "helpful":
-        input_json["day_range"] = min(day_range, MAX_DAY_RANGE) if day_range > 0 else 0
-    elif day_range:
-        logger.warning(
-            f"day_range={day_range} проигнорирован: применяется только к Helpful."
-        )
+    dr_start = normalized_params.get("date_range_start")
+    dr_end = normalized_params.get("date_range_end")
+
+    if day_range and day_range > 0:
+        if sort_by == "helpful":
+            input_json["day_range"] = min(day_range, MAX_DAY_RANGE)
+        elif dr_start is None and dr_end is None:
+            now_ts = int(datetime.now(timezone.utc).timestamp())
+            effective_days = min(day_range, MAX_DAY_RANGE)
+            dr_start = now_ts - effective_days * 86400
+            dr_end = now_ts
+            logger.info(
+                "day_range=%d сконвертирован в date_range "
+                "(sort_by=%r не поддерживает day_range).",
+                effective_days, sort_by,
+            )
+
+    if dr_start is not None and dr_end is not None:
+        input_json["date_range_start"] = int(dr_start)
+        input_json["date_range_end"] = int(dr_end)
+    elif dr_start is not None or dr_end is not None:
+        logger.warning("date_range_start и date_range_end должны быть заданы вместе.")
 
     dr_start = normalized_params.get("date_range_start")
     dr_end = normalized_params.get("date_range_end")

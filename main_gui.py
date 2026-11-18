@@ -1,10 +1,9 @@
 """
 GUI-приложение для анализа отзывов Steam.
 Запуск:
-    pip install PyQt6 markdown
-    python main_gui.py
+pip install PyQt6 markdown
+python main_gui.py
 """
-
 import os
 import sqlite3
 import sys
@@ -16,9 +15,8 @@ from PyQt6.QtGui import QKeyEvent, QTextCursor, QFont, QPainter, QColor, QPen
 from PyQt6.QtWidgets import (
     QApplication, QFrame, QHBoxLayout, QLabel, QListWidget,
     QListWidgetItem, QMainWindow, QPushButton, QTextBrowser,
-    QTextEdit, QVBoxLayout, QWidget
+    QTextEdit, QVBoxLayout, QWidget, QMenu, QInputDialog
 )
-
 try:
     import markdown as md_lib
     HAS_MARKDOWN = True
@@ -29,16 +27,15 @@ except ImportError:
 # Константы и стили
 # ==========================================================
 DB_PATH = "local_storage.db"
-
-C_BG_DEEP      = "#171a21"   # Глубокий фон
-C_BG_PANEL     = "#1b2838"   # Панели (темные сообщения ИИ)
-C_BG_BLOCK     = "#2a475e"   # Блоки (светлые сообщения пользователя)
-C_BORDER       = "#3d5a73"   # Границы (сделана заметнее)
-C_TEXT         = "#e8e8e8"   # Основной текст
-C_TEXT_DIM     = "#8f9baa"   # Второстепенный текст
-C_AI           = "#00a4ff"   # Яркий Steam-синий
-C_ERROR        = "#ff5555"
-C_ERROR_BG     = "#3a1a1a"
+C_BG_DEEP      =  "#171a21"   # Глубокий фон
+C_BG_PANEL     =  "#1b2838"   # Панели (темные сообщения ИИ)
+C_BG_BLOCK     =  "#2a475e"   # Блоки (светлые сообщения пользователя)
+C_BORDER       =  "#3d5a73"   # Границы (сделана заметнее)
+C_TEXT         =  "#e8e8e8"   # Основной текст
+C_TEXT_DIM     =  "#8f9baa"   # Второстепенный текст
+C_AI           =  "#00a4ff"   # Яркий Steam-синий
+C_ERROR        =  "#ff5555"
+C_ERROR_BG     =  "#3a1a1a"
 
 # ==========================================================
 # Кастомная кнопка отправки
@@ -53,7 +50,6 @@ class SendButton(QPushButton):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-
         is_hovered = self.underMouse()
         is_enabled = self.isEnabled()
 
@@ -68,7 +64,6 @@ class SendButton(QPushButton):
         else:
             painter.setBrush(Qt.BrushStyle.NoBrush)
             painter.setPen(QPen(QColor(C_BORDER), 2))
-
         painter.drawEllipse(2, 2, 36, 36)
 
         # Цвет стрелки
@@ -79,7 +74,6 @@ class SendButton(QPushButton):
 
         # Рисуем стрелку (толстую и короткую)
         painter.setPen(QPen(arrow_color, 2.5, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
-        
         cx, cy = 20, 20
         # Вертикальная линия
         painter.drawLine(cx, cy - 7, cx, cy + 7)
@@ -109,18 +103,21 @@ class InitWorker(QThread):
     def run(self):
         try:
             from dialog_manager import DialogManager
-            
             class GuiDialogManager:
                 def __init__(self, db_path):
                     self.db_path = db_path
                     self._init_db_session()
                     self._dm = DialogManager(db_path=db_path)
                     self.session_id = str(uuid.uuid4()) 
-
+                
                 def _init_db_session(self):
                     with sqlite3.connect(self.db_path) as conn:
                         try:
                             conn.execute("ALTER TABLE journal ADD COLUMN session_id TEXT")
+                        except sqlite3.OperationalError:
+                            pass
+                        try:
+                            conn.execute("ALTER TABLE journal ADD COLUMN session_name TEXT")
                         except sqlite3.OperationalError:
                             pass
 
@@ -136,12 +133,19 @@ class InitWorker(QThread):
                         except Exception as e:
                             import logging
                             logging.getLogger(__name__).error(f"Ошибка записи: {e}")
-                            
+
                     self._dm._save_to_journal = patched_save
                     try:
                         return self._dm.handle_request(query, history=history)
                     finally:
                         self._dm._save_to_journal = original_save
+
+                def close(self):
+                    """Освобождает ресурсы DialogManager при закрытии приложения."""
+                    try:
+                        self._dm.close()
+                    except Exception:
+                        pass
 
                 @property
                 def ollama(self):
@@ -185,7 +189,7 @@ class MainWindow(QMainWindow):
         self.history = []
         self.current_worker = None
         self.init_worker = None
-
+        
         self._loading_base = ""
         self._loading_dots = 0
         self._loading_timer = QTimer(self)
@@ -221,7 +225,14 @@ class MainWindow(QMainWindow):
         sb_layout.addWidget(self.new_chat_btn)
 
         self.history_list = QListWidget()
+        # Убираем горизонтальный скроллбар и переносы, включаем обрезание троеточием
+        self.history_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.history_list.setWordWrap(False)
+        self.history_list.setTextElideMode(Qt.TextElideMode.ElideRight)
+        
         self.history_list.itemClicked.connect(self._on_history_click)
+        self.history_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.history_list.customContextMenuRequested.connect(self._show_history_context_menu)
         sb_layout.addWidget(self.history_list, 1)
 
         root.addWidget(sidebar)
@@ -271,13 +282,11 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(f"""
             QMainWindow {{ background-color: {C_BG_DEEP}; }}
             QWidget {{ font-family: 'Segoe UI', 'Inter', sans-serif; font-size: 15px; }}
-            
             QWidget#Sidebar {{
                 background-color: {C_BG_PANEL};
                 border-right: 1px solid {C_BORDER};
             }}
             QWidget#MainArea {{ background-color: {C_BG_DEEP}; }}
-            
             QLabel#AppTitle {{
                 color: {C_AI};
                 font-size: 22px;
@@ -290,7 +299,6 @@ class MainWindow(QMainWindow):
                 font-size: 14px;
                 padding: 4px 8px;
             }}
-            
             QListWidget {{
                 background-color: transparent;
                 border: none;
@@ -309,7 +317,6 @@ class MainWindow(QMainWindow):
                 color: {C_AI};
                 border-left: 3px solid {C_AI};
             }}
-            
             QPushButton {{
                 background-color: {C_BG_BLOCK};
                 color: {C_TEXT};
@@ -326,7 +333,6 @@ class MainWindow(QMainWindow):
                 color: {C_TEXT_DIM};
                 background-color: {C_BG_PANEL};
             }}
-            
             /* Чат и поля ввода */
             QTextBrowser#ChatView {{
                 background-color: {C_BG_DEEP};
@@ -349,7 +355,6 @@ class MainWindow(QMainWindow):
                 padding: 4px;
                 selection-background-color: {C_AI};
             }}
-            
             /* Скроллбар: полностью прозрачный фон, круглый ползунок */
             QScrollBar:vertical {{
                 background: transparent;
@@ -408,7 +413,6 @@ class MainWindow(QMainWindow):
         cursor.movePosition(QTextCursor.MoveOperation.End)
         cursor.insertHtml(html)
         cursor.insertBlock() # Создает новый абзац, отделяя от следующего сообщения
-        
         sb = self.chat_view.verticalScrollBar()
         sb.setValue(sb.maximum())
 
@@ -500,15 +504,16 @@ class MainWindow(QMainWindow):
 
         self.input_field.clear()
         self._append_chat_html(self._user_html(query))
-        hist_snapshot = list(self.history)
 
+        hist_snapshot = list(self.history)
+        
         self.input_field.setEnabled(False)
         self.send_btn.setEnabled(False)
         self.history_list.setEnabled(False)
         self.new_chat_btn.setEnabled(False)
-
+        
         self._start_loading("Нейросеть анализирует отзывы, это может занять некоторое время")
-
+        
         self.current_worker = QueryWorker(self.dm, query, hist_snapshot)
         self.current_worker.finished_ok.connect(self._on_query_ok)
         self.current_worker.failed.connect(self._on_query_err)
@@ -545,7 +550,7 @@ class MainWindow(QMainWindow):
             with sqlite3.connect(DB_PATH) as conn:
                 rows = conn.execute("""
                     SELECT session_id, MIN(timestamp) as ts, game, 
-                           (SELECT user_query FROM journal WHERE session_id = j.session_id ORDER BY id ASC LIMIT 1) as first_query
+                           COALESCE(MAX(session_name), (SELECT user_query FROM journal WHERE session_id = j.session_id ORDER BY id ASC LIMIT 1)) as display_name
                     FROM journal j
                     GROUP BY session_id
                     ORDER BY ts DESC LIMIT 100
@@ -554,26 +559,76 @@ class MainWindow(QMainWindow):
             print(f"[GUI] Ошибка чтения журнала: {e}")
             return
 
-        for session_id, ts, game, first_query in rows:
-            label = self._format_sidebar_label(first_query, game)
+        for session_id, ts, game, display_name in rows:
+            label = self._format_sidebar_label(display_name, game)
             item = QListWidgetItem(label)
             item.setData(Qt.ItemDataRole.UserRole, session_id)
-            item.setToolTip(f"{ts}\n\n{first_query}")
+            
+            # Форматируем время в человекочитаемый вид
+            try:
+                dt = datetime.fromisoformat(ts)
+                human_ts = dt.strftime("%d.%m.%Y %H:%M")
+            except Exception:
+                human_ts = ts
+                
+            # Подсказка содержит время и полное название
+            item.setToolTip(f"{human_ts}\n\n{display_name}")
             self.history_list.addItem(item)
 
     @staticmethod
     def _format_sidebar_label(query: str, game: str | None) -> str:
         q = (query or "").strip().replace("\n", " ")
-        if len(q) > 32:
-            q = q[:32] + "..."
         game_str = game if game and game != "None" else ""
         if game_str:
             return f"[{game_str}] {q}"
         return q or "(без названия)"
 
+    def _show_history_context_menu(self, pos):
+        """Контекстное меню для переименования диалога."""
+        item = self.history_list.itemAt(pos)
+        if not item:
+            return
+        
+        menu = QMenu(self)
+        rename_action = menu.addAction("Переименовать")
+        
+        action = menu.exec(self.history_list.mapToGlobal(pos))
+        if action == rename_action:
+            self._rename_session(item)
+
+    def _rename_session(self, item: QListWidgetItem):
+        """Обновление названия диалога в БД и интерфейсе."""
+        session_id = item.data(Qt.ItemDataRole.UserRole)
+        if not session_id:
+            return
+            
+        current_text = item.text()
+        new_name, ok = QInputDialog.getText(self, "Переименовать диалог", "Новое название:", text=current_text)
+        
+        if ok and new_name.strip():
+            new_name = new_name.strip()
+            try:
+                with sqlite3.connect(DB_PATH) as conn:
+                    conn.execute("UPDATE journal SET session_name = ? WHERE session_id = ?", (new_name, session_id))
+                
+                # Обновляем текст элемента
+                item.setText(new_name)
+                
+                # Обновляем подсказку, сохраняя время
+                old_tooltip = item.toolTip()
+                if "\n\n" in old_tooltip:
+                    time_part = old_tooltip.split("\n\n")[0]
+                    item.setToolTip(f"{time_part}\n\n{new_name}")
+                else:
+                    item.setToolTip(new_name)
+                    
+            except Exception as e:
+                print(f"[GUI] Ошибка переименования: {e}")
+
     def _on_history_click(self, item: QListWidgetItem):
         if self.current_worker is not None:
             return
+
         session_id = item.data(Qt.ItemDataRole.UserRole)
         if not session_id:
             return
@@ -587,24 +642,24 @@ class MainWindow(QMainWindow):
         except Exception as e:
             print(f"[GUI] Ошибка загрузки сессии: {e}")
             return
-            
+
         if not rows:
             return
 
         self.chat_view.clear()
         self.history = []
-        
         for query, game, response in rows:
             self._append_chat_html(self._user_html(query))
             self._append_chat_html(self._ai_html(response))
             self.history.append({"role": "user", "content": query})
             self.history.append({"role": "assistant", "content": response})
-            
+
         self.dm.session_id = session_id
 
     def _new_chat(self):
         if self.current_worker is not None:
             return
+
         self.chat_view.clear()
         self.history = []
         if self.dm:
@@ -618,20 +673,38 @@ class MainWindow(QMainWindow):
         if self.init_worker and self.init_worker.isRunning():
             self.init_worker.quit()
             self.init_worker.wait(2000)
-        if self.dm and hasattr(self.dm, "ollama"):
+
+        # Выгружаем модель из памяти Ollama и (если сервер был запущен нами)
+        # полностью останавливаем его через минуту после закрытия приложения.
+        if self.dm:
             try:
-                self.dm.ollama.unload_model()
+                if hasattr(self.dm, "close"):
+                    self.dm.close()
+                elif hasattr(self.dm, "ollama"):
+                    self.dm.ollama.unload_model()
             except Exception:
                 pass
+
+            ollama_mgr = getattr(self.dm, "ollama", None)
+            proc = ollama_mgr.server_process() if hasattr(ollama_mgr, "server_process") else None
+            if proc is not None:
+                QTimer.singleShot(60_000, lambda: self._shutdown_ollama(ollama_mgr))
+
         event.accept()
+
+    @staticmethod
+    def _shutdown_ollama(ollama_mgr):
+        """Через минуту после выхода: выгрузить модель и остановить `ollama serve`."""
+        try:
+            ollama_mgr.stop_server()
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
-    
     font = QFont("Segoe UI", 10)
     app.setFont(font)
-    
     window = MainWindow()
     window.show()
     sys.exit(app.exec())

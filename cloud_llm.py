@@ -27,6 +27,39 @@ class CloudLLM:
     def enabled(self) -> bool:
         return bool(self.model and self.client)
 
+    def chat_text(self, system_prompt: str, user_prompt: str,
+                  history: Optional[list] = None) -> str:
+        """Генерирует обычный текстовый ответ без JSON-схемы."""
+        t0 = time.monotonic()
+        messages = [{"role": "system", "content": system_prompt}]
+        if history:
+            messages.extend(history[-3:])
+        messages.append({"role": "user", "content": user_prompt})
+
+        try:
+            resp = self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                temperature=0.3,
+                max_tokens=700,
+            )
+            self.last_latency_ms = (time.monotonic() - t0) * 1000
+            usage = resp.usage
+            if usage:
+                self.last_tokens = {
+                    "prompt": usage.prompt_tokens,
+                    "completion": usage.completion_tokens,
+                }
+            text = (resp.choices[0].message.content or "").strip()
+            if not text:
+                raise CloudLLMError("Пустой ответ облачной модели")
+            return text
+        except CloudLLMError:
+            raise
+        except Exception as e:
+            logger.error("[CloudLLM] chat_text: %s: %s", type(e).__name__, e)
+            raise CloudLLMError(str(e)) from e
+
     def chat_json(self, prompt: str, schema: dict, stage: str) -> dict:
         """Structured output. Бросает CloudLLMError при любой проблеме."""
         t0 = time.monotonic()

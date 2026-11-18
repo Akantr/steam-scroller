@@ -12,7 +12,7 @@ import numpy as np
 import torch
 from transformers import AutoTokenizer, AutoModelForQuestionAnswering
 from rapidfuzz import fuzz
-import ollama
+from ollama import Client as _OllamaClient
 from intent import OllamaManager, OLLAMA_MODEL_NAME
 import time
 
@@ -231,6 +231,8 @@ CALIBRATION_DIR = Path(os.getenv("CALIBRATION_DIR", "calibration"))
 PHASE0_DUMP_ENABLED = os.getenv("PHASE0_DUMP", "1") == "1"
 
 _CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
+
+OLLAMA_BASE_URL = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 
 
 class LLMJSONError(Exception):
@@ -797,7 +799,7 @@ class ReviewProcessor:
     ):
         self.ollama = ollama_manager if ollama_manager else OllamaManager(model_name=model_name)
         self.model_name = model_name
-        self.ollama_client = ollama
+        self.ollama_client = _OllamaClient(host=self.ollama.base_url)
         self.batch_size = batch_size
 
         from cloud_llm import CloudLLM, CloudLLMError
@@ -891,9 +893,11 @@ class ReviewProcessor:
     def _extract_warnings(self, dm_output: Dict[str, Any]) -> List[str]:
         warnings: List[str] = []
         meta = dm_output.get("meta", {})
-        if dm_output.get("status") == "insufficient_data" or meta.get("insufficient_data"):
+        raw_reviews_count = meta.get("raw_reviews_count")
+        if raw_reviews_count is not None and raw_reviews_count < 200:
             warnings.append(
-                "Внимание: Найдено менее 30 отзывов. Сводка может быть нерепрезентативной."
+                "Внимание: из Steam загружено менее 200 отзывов "
+                f"({raw_reviews_count}). Сводка может быть нерепрезентативной."
             )
         if meta.get("days_since_last_review", 0) > 60:
             warnings.append(
@@ -1067,7 +1071,7 @@ class ReviewProcessor:
 
 "topic" — краткое название категории: «Боевка», «Сюжет», «Графика», «Звук», «Оптимизация»,
 «Сложность», «Баги», «Цена», «Боссы», «Прогрессия», «Геймплей», «Атмосфера», «Содержание»,
-«Исследование», «Сообщество», «Вариативность». НЕ цитируй сами цитаты.
+«Исследование», «Сообщество», «Вариативность», «Функции». НЕ цитируй сами цитаты.
 
 Верни строго JSON:
 {{"findings": [{{"idx": 0, "topic": "Боевка", "sentiment": "positive"}}]}}
@@ -1744,7 +1748,7 @@ sentiment пункта должен соответствовать смыслу 
                     "repeat_penalty": repeat_penalty,
                     "repeat_last_n": 256,
                 }
-                resp = ollama.chat(
+                resp = self.ollama_client.chat(
                     model=self.model_name,
                     messages=[
                         {"role": "system", "content": "Ты возвращаешь только валидный JSON."},

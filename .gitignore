@@ -30,6 +30,8 @@ deepseek_python_20261110_4454d3.py
 W.PY
 test_full_pipeline.py
 eval_preprocessor.py
+test_text_intents.py
+
 
 # Кэш HF / vLLM
 .cache/
