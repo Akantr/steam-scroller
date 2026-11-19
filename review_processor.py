@@ -15,6 +15,7 @@ from rapidfuzz import fuzz
 from ollama import Client as _OllamaClient
 from intent import OllamaManager, OLLAMA_MODEL_NAME
 import time
+import math
 
 logger = logging.getLogger(__name__)
 
@@ -549,6 +550,131 @@ def _dump_calibration_pairs(
             fh.write(json.dumps(row, ensure_ascii=False) + "\n")
     logger.info("[0.5] Calibration pairs → %s (%d строк)", path, len(sample))
 
+def _render_timeline_png(timeline: Dict[str, Any]) -> Optional[str]:
+    """Рендерит график в стиле страницы магазина Steam (тёмный фон,
+    синие положительные, оранжевые отрицательные). PNG → base64."""
+    try:
+        import io
+        import base64
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        logger.warning("Pillow не установлен — график будет пропущен.")
+        return None
+
+    labels = timeline.get("labels") or []
+    pos = timeline.get("positive") or []
+    neg = timeline.get("negative") or []
+    if not labels:
+        return None
+
+    W, H = 1000, 400
+    PAD_L, PAD_R, PAD_T, PAD_B = 65, 30, 32, 70
+    chart_w = W - PAD_L - PAD_R
+    chart_h = H - PAD_T - PAD_B
+
+    # Палитра Steam
+    C_BG     = "#1b2838"
+    C_AXIS   = "#3d5a73"
+    C_POS    = "#66c0f4"   # Steam-blue
+    C_NEG    = "#c35a0a"   # Оранжевый
+    C_TEXT   = "#8f9baa"
+    C_LEGEND = "#c6d4df"
+
+    img = Image.new("RGB", (W, H), C_BG)
+    draw = ImageDraw.Draw(img)
+
+    try:
+        font = ImageFont.truetype("arial.ttf", 13)
+        small = ImageFont.truetype("arial.ttf", 11)
+    except Exception:
+        font = small = ImageFont.load_default()
+
+    # Красивый максимум по Y
+    raw_max = max(max(pos, default=1), max(neg, default=1), 1)
+    magnitude = 10 ** int(math.log10(raw_max)) if raw_max > 0 else 1
+    ratio = raw_max / magnitude
+    if ratio < 1.5:
+        max_val = magnitude * 2
+    elif ratio < 3:
+        max_val = magnitude * 5
+    elif ratio < 7:
+        max_val = magnitude * 10
+    else:
+        max_val = magnitude * 20
+
+    # Оси
+    draw.line([(PAD_L, PAD_T), (PAD_L, PAD_T + chart_h)], fill=C_AXIS, width=1)
+    draw.line(
+        [(PAD_L, PAD_T + chart_h), (W - PAD_R, PAD_T + chart_h)],
+        fill=C_AXIS, width=1,
+    )
+
+    n = len(labels)
+    group_w = chart_w / max(n, 1)
+    bar_w = max(1.5, min(15.0, group_w * 0.42))
+
+    for i in range(n):
+        x_center = PAD_L + group_w * i + group_w / 2
+
+        # Положительные (синие) — слева от центра
+        h_pos = chart_h * (pos[i] if i < len(pos) else 0) / max_val
+        if h_pos >= 0.5:
+            x0 = x_center - bar_w
+            draw.rectangle(
+                [x0, PAD_T + chart_h - h_pos, x0 + bar_w, PAD_T + chart_h],
+                fill=C_POS,
+            )
+
+        # Отрицательные (оранжевые) — справа от центра
+        h_neg = chart_h * (neg[i] if i < len(neg) else 0) / max_val
+        if h_neg >= 0.5:
+            x0n = x_center
+            draw.rectangle(
+                [x0n, PAD_T + chart_h - h_neg, x0n + bar_w, PAD_T + chart_h],
+                fill=C_NEG,
+            )
+
+    # X-подписи: прореживаем, чтобы не слипались
+    step = max(1, n // 10)
+    for i in range(0, n, step):
+        x = PAD_L + group_w * i + group_w / 2
+        label = labels[i]
+        try:
+            bbox = draw.textbbox((0, 0), label, font=small)
+            tw = bbox[2] - bbox[0]
+        except Exception:
+            tw = 50
+        draw.text((x - tw / 2, PAD_T + chart_h + 10), label,
+                  fill=C_TEXT, font=small)
+
+    # Y-метки
+    for frac in (0.0, 0.25, 0.5, 0.75, 1.0):
+        val = int(max_val * frac)
+        y = PAD_T + chart_h * (1 - frac)
+        s = f"{val:,}".replace(",", " ")
+        try:
+            bbox = draw.textbbox((0, 0), s, font=small)
+            tw = bbox[2] - bbox[0]
+        except Exception:
+            tw = 30
+        draw.text((PAD_L - tw - 8, y - 6), s, fill=C_TEXT, font=small)
+        draw.line(
+            [(PAD_L - 4, y), (PAD_L, y)], fill=C_AXIS, width=1,
+        )
+
+    # Легенда
+    legend_y = 8
+    draw.rectangle([PAD_L, legend_y, PAD_L + 12, legend_y + 12], fill=C_POS)
+    draw.text((PAD_L + 18, legend_y - 1), "Положительные",
+              fill=C_LEGEND, font=font)
+    draw.rectangle([PAD_L + 160, legend_y, PAD_L + 172, legend_y + 12], fill=C_NEG)
+    draw.text((PAD_L + 178, legend_y - 1), "Отрицательные",
+              fill=C_LEGEND, font=font)
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
 
 def _topic_quote_score(topic: str, quote: str) -> float:
     t = (topic or "").lower().strip()
@@ -874,11 +1000,25 @@ class ReviewProcessor:
             if sub_tasks and "table" in sub_tasks:
                 logger.info("Запуск Reduce-этапа (таблица)...")
                 table_md = self._reduce_table(mapped_findings, game, user_query)
+
+            
+            chart_png = None
+            if sub_tasks and "graph" in sub_tasks:
+                timeline = dm_output.get("timeline")
+                if timeline:
+                    chart_png = _render_timeline_png(timeline)
+                    if chart_png:
+                        logger.info(
+                            "График динамики отзывов отрендерен: %d точек",
+                            len(timeline.get("labels") or []),
+                             )
+
             return {
                 "status": "success",
                 "game": game,
                 "summary": summary_md,
                 "table": table_md,
+                "chart_png": chart_png,
                 "warnings": warnings,
                 "meta": meta,
             }

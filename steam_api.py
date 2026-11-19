@@ -83,8 +83,8 @@ def resolve_appid(game_name: str, timeout: int = 10) -> int:
 
     params = {
         "term": game_name.strip(),
-        "l": "russian",
-        "cc": "RU",
+        "l": "english",
+        "cc": "US",
     }
 
     # --- 1. Запрос к Steam Store Search ---

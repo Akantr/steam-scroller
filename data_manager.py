@@ -10,6 +10,12 @@ from sentence_transformers import SentenceTransformer
 import steam_api
 import preprocessor
 
+import math
+import requests
+from collections import Counter, defaultdict
+from datetime import datetime, timezone
+from typing import Optional
+
 logger = logging.getLogger(__name__)
 
 # ==========================================
@@ -134,6 +140,67 @@ def _select_diverse(texts: List[str], max_output: int) -> List[int]:
         selected.append(i)
     return selected
 
+_MONTHS_RU = ["янв.", "февр.", "мар.", "апр.", "мая", "июн.",
+              "июл.", "авг.", "сент.", "окт.", "нояб.", "дек."]
+
+
+def fetch_histogram_from_steam(appid: int, language: str = "russian") -> Optional[Dict[str, Any]]:
+        """Тянет агрегированную историю отзывов из того же эндпоинта, что использует
+        страница магазина Steam. Возвращает timeline в формате
+        {labels, positive, negative, granularity} или None при любой ошибке."""
+        url = f"https://store.steampowered.com/appreviewhistogram/{appid}"
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+            "Referer": f"https://store.steampowered.com/app/{appid}/",
+        }
+        try:
+            resp = requests.get(
+                url, params={"l": language},
+                headers=headers, timeout=10,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            logger.warning("appreviewhistogram недоступен: %s: %s", type(e).__name__, e)
+            return None
+
+        if data.get("success") != 1:
+            logger.warning("appreviewhistogram вернул success=%r", data.get("success"))
+            return None
+
+        rollups = (data.get("results") or {}).get("rollups") or []
+        if not rollups:
+            return None
+
+        labels, positive, negative = [], [], []
+        for item in rollups:
+            ts = item.get("date")
+            if not ts:
+                continue
+            try:
+                dt = datetime.utcfromtimestamp(int(ts))
+            except (ValueError, OSError, OverflowError):
+                continue
+            labels.append(f"{_MONTHS_RU[dt.month - 1]} {dt.year}")
+            positive.append(int(item.get("recommendations_up") or 0))
+            negative.append(int(item.get("recommendations_down") or 0))
+
+        if not labels:
+            return None
+
+        return {
+            "labels": labels,
+            "positive": positive,
+            "negative": negative,
+            "granularity": (data.get("results") or {}).get("rollup_type", "monthly"),
+            "source": "steam_histogram",
+        }
 
 def _enrich_with_metadata(
     texts: List[str], reviews: List[Dict[str, Any]]
@@ -180,6 +247,39 @@ def _log_coverage(enriched: List[Dict[str, Any]]) -> None:
             "Слабо покрытые аспекты (риск склейки признаков): %s", weak
         )
 
+def _build_timeline(reviews: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """По-месячная шкала «положительные / отрицательные» по timestamp_created и voted_up.
+
+    Строится по cleaned_reviews (до семантического отбора), иначе стратификация
+    по аспектам исказит распределение по времени. Возвращает None, если нет
+    ни одного валидного timestamp.
+    """
+    buckets: Dict[str, Dict[str, int]] = defaultdict(lambda: {"pos": 0, "neg": 0})
+    for r in reviews:
+        ts = r.get("timestamp_created")
+        if not ts:
+            continue
+        try:
+            dt = datetime.fromtimestamp(int(ts), tz=timezone.utc)
+        except (ValueError, OSError, OverflowError):
+            continue
+        key = dt.strftime("%Y-%m")
+        if r.get("voted_up", True):
+            buckets[key]["pos"] += 1
+        else:
+            buckets[key]["neg"] += 1
+
+    if not buckets:
+        return None
+
+    labels = sorted(buckets.keys())
+    return {
+        "labels": labels,
+        "positive": [buckets[k]["pos"] for k in labels],
+        "negative": [buckets[k]["neg"] for k in labels],
+        "granularity": "month",
+    }
+
 
 def _deduplicate(
     texts: List[str], embeddings: np.ndarray, threshold: float
@@ -199,6 +299,7 @@ def _deduplicate(
             continue
         kept.append(i)
     return sorted(kept)
+
 
 
 def _semantic_filter_with_embeddings(
@@ -430,8 +531,18 @@ class DataManager:
         cleaned_reviews = clean_result["reviews"]
         clean_stats = clean_result["stats"]
         cleaned_count = len(cleaned_reviews)
+        timeline = fetch_histogram_from_steam(appid, language="russian")
+        if timeline is None:
+            timeline = _build_timeline(cleaned_reviews)
+            if timeline:
+                timeline["source"] = "cleaned_reviews"
+                logger.info(
+                    "appreviewhistogram недоступен — timeline построен по %d отзывам.",
+                    len(cleaned_reviews),
+                )
         if not cleaned_reviews:
             return _make_error("Все отзывы были отфильтрованы как неинформативные.")
+        timeline = _build_timeline(cleaned_reviews)
 
         # Шаг 7. Семантическая обработка (теперь возвращает List[Dict])
         final_reviews = semantic_filter(cleaned_reviews, max_output=self.max_output)
@@ -469,6 +580,7 @@ class DataManager:
                 "appid": appid,
                 "reviews_count": len(final_reviews),
                 "reviews": final_reviews,
+                "timeline": timeline, 
                 "sub_tasks": normalized.get("sub_tasks", []),
                 "meta": {
                     "raw_reviews_count": raw_count,
@@ -491,6 +603,7 @@ class DataManager:
                 "appid": appid,
                 "reviews_count": len(final_reviews),
                 "reviews": final_reviews,
+                "timeline": timeline, 
                 "sub_tasks": normalized.get("sub_tasks", []),
                 "meta": {
                     "raw_reviews_count": raw_count,
